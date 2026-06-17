@@ -686,32 +686,38 @@ class GroupManagerPlugin(Star):
         await self.put_kv_data("groups", groups)
         yield event.plain_result(f"✅ 当前群已设为联动组 [{net_name}] 的播报群")
 
-    @filter.message_type("notice")
-    async def on_notice(self, event: AstrMessageEvent):
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def handle_event(self, event: AstrMessageEvent):
         """
-        处理通知类事件（notice）
+        处理所有事件（消息和通知）
 
-        这是 AstrBot Star 插件的标准钩子，用于处理 OneBot v11 的通知事件
+        参考 github_star_verify 插件的实现方式
         """
         try:
-            if not hasattr(event, 'message_obj'):
+            # 只处理 aiocqhttp 平台（OneBot v11）
+            if event.get_platform_name() != "aiocqhttp":
                 return
 
-            message_obj = event.message_obj
+            # 获取原始事件数据
+            raw = event.message_obj.raw_message
+            post_type = raw.get("post_type")
 
-            # 获取事件类型
-            post_type = getattr(message_obj, 'post_type', None)
-            notice_type = getattr(message_obj, 'notice_type', None)
+            logger.debug(f"[黑名单拦截] handle_event 被调用: post_type={post_type}")
 
-            logger.info(f"[黑名单拦截] on_notice 被调用: post_type={post_type}, notice_type={notice_type}")
+            # 只处理通知类型事件
+            if post_type != "notice":
+                return
+
+            notice_type = raw.get("notice_type")
+            logger.info(f"[黑名单拦截] 收到通知事件: notice_type={notice_type}")
 
             # 只处理群成员增加事件
-            if post_type != 'notice' or notice_type != 'group_increase':
+            if notice_type != "group_increase":
                 return
 
             # 提取信息
-            user_id = getattr(message_obj, 'user_id', None)
-            group_id = getattr(message_obj, 'group_id', None)
+            user_id = raw.get("user_id")
+            group_id = raw.get("group_id")
 
             if not user_id or not group_id:
                 logger.warning(f"[黑名单拦截] 群成员增加事件缺少必要字段")
@@ -723,7 +729,7 @@ class GroupManagerPlugin(Star):
             await self.check_and_kick_blacklist(str(user_id), str(group_id))
 
         except Exception as e:
-            logger.error(f"[黑名单拦截] 处理通知事件失败: {e}", exc_info=True)
+            logger.error(f"[黑名单拦截] 处理事件失败: {e}", exc_info=True)
 
     async def check_and_kick_blacklist(self, new_member_qq: str, group_id: str):
         """
