@@ -128,12 +128,20 @@ class GroupManagerPlugin(Star):
         return None
 
     async def get_group_network_async(self, group_id: str) -> Optional[tuple]:
-        """异步获取群所属的网络组，返回 (组名, 配置)"""
+        """异步获取群所属的网络组，返回 (组名, 配置)
+
+        支持两种群号格式的匹配：
+        - 完整格式: aiocqhttp:GroupMessage:1101147419
+        - 纯群号: 1101147419
+        """
         groups = await self.get_kv_data("groups", {})
 
         if not isinstance(groups, dict):
             logger.error(f"groups 配置格式错误: {type(groups)}")
             return None
+
+        # 提取传入群号的纯群号部分
+        pure_gid = group_id.split(':')[-1] if ':' in group_id else group_id
 
         for net_name, net_config in groups.items():
             if not isinstance(net_config, dict):
@@ -145,8 +153,11 @@ class GroupManagerPlugin(Star):
                 logger.error(f"执行群列表格式错误: {type(exec_list)}")
                 continue
 
-            if group_id in exec_list:
-                return net_name, net_config
+            # 同时支持完整格式和纯群号匹配
+            for exec_gid in exec_list:
+                exec_pure = exec_gid.split(':')[-1] if ':' in exec_gid else exec_gid
+                if exec_gid == group_id or exec_pure == pure_gid:
+                    return net_name, net_config
         return None
 
     def add_record(self, action_type: str, target_qq: str, operator_qq: str,
@@ -766,15 +777,7 @@ class GroupManagerPlugin(Star):
 
             logger.warning(f"发现黑名单用户 {new_member_qq} 加入群 {group_id}")
 
-            # 获取群网络信息
-            network_info = await self.get_group_network_async(group_id)
-            if not network_info:
-                logger.info(f"群 {group_id} 未加入任何联动组，跳过黑名单拦截")
-                return
-
-            net_name, net_config = network_info
-
-            # 踢出并拉黑
+            # 踢出并拉黑（无论群是否加入联动组，命中黑名单一律踢出）
             pure_gid = group_id.split(':')[-1] if ':' in group_id else group_id
             platforms = self.context.platform_manager.get_insts()
             kicked = False
@@ -793,15 +796,23 @@ class GroupManagerPlugin(Star):
                             logger.info(f"成功踢出并拉黑黑名单用户 {new_member_qq} (群 {group_id})")
                             break
                         except Exception as e:
-                            logger.debug(f"平台踢出黑名单用户失败: {e}")
+                            logger.warning(f"平台踢出黑名单用户失败: {e}")
                             continue
+
+            # 获取群网络信息（用于播报），找不到则跳过播报但不影响踢人
+            network_info = await self.get_group_network_async(group_id)
+            if not network_info:
+                logger.info(f"群 {group_id} 未加入任何联动组，已执行踢出但跳过播报")
+                return
+
+            net_name, net_config = network_info
 
             if kicked:
                 # 播报拦截信息
                 broadcast_msg = (
                     f"🚫 【黑名单自动拦截】\n"
                     f"目标QQ: {new_member_qq}\n"
-                    f"拦截群: {group_id}\n"
+                    f"拦截群: {pure_gid}\n"
                     f"原处罚原因: {blacklist_entry.get('reason', '未知')}\n"
                     f"加入黑名单时间: {blacklist_entry.get('time', '未知')}\n"
                     f"原操作者: {blacklist_entry.get('operator', '未知')}\n"
@@ -815,7 +826,7 @@ class GroupManagerPlugin(Star):
                 broadcast_msg = (
                     f"⚠️ 【黑名单拦截失败】\n"
                     f"目标QQ: {new_member_qq}\n"
-                    f"群: {group_id}\n"
+                    f"群: {pure_gid}\n"
                     f"原因: {blacklist_entry.get('reason', '未知')}\n"
                     f"状态: 检测到黑名单用户加群，但踢出失败（可能权限不足）"
                 )
