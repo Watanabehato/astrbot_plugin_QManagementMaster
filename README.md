@@ -1,14 +1,222 @@
-# astrbot-plugin-helloworld
+# QQ多群联动违规管理插件 (QManagementMaster)
 
-AstrBot 插件模板 / A template plugin for AstrBot plugin feature
+一个功能强大的 AstrBot 插件，支持多群联动的违规管理系统，提供禁言、踢人、警告、黑名单等完整的群管理功能。
 
-> [!NOTE]
-> This repo is just a template of [AstrBot](https://github.com/AstrBotDevs/AstrBot) Plugin.
-> 
-> [AstrBot](https://github.com/AstrBotDevs/AstrBot) is an agentic assistant for both personal and group conversations. It can be deployed across dozens of mainstream instant messaging platforms, including QQ, Telegram, Feishu, DingTalk, Slack, LINE, Discord, Matrix, etc. In addition, it provides a reliable and extensible conversational AI infrastructure for individuals, developers, and teams. Whether you need a personal AI companion, an intelligent customer support agent, an automation assistant, or an enterprise knowledge base, AstrBot enables you to quickly build AI applications directly within your existing messaging workflows.
+## ✨ 核心特性
 
-# Supports
+- 🔗 **多群联动**：支持多个 QQ 群组成联动网络，一次操作同步执行
+- 🛡️ **双层权限**：超管和群管分级权限控制
+- 📊 **完整记录**：SQLite 数据库存储所有处罚记录，可查询和撤销
+- 🚫 **智能黑名单**：自动拦截黑名单用户进群（支持 OneBot v11 协议）
+- 📢 **播报系统**：所有处罚操作自动向播报群推送通知
 
-- [AstrBot Repo](https://github.com/AstrBotDevs/AstrBot)
-- [AstrBot Plugin Development Docs (Chinese)](https://docs.astrbot.app/dev/star/plugin-new.html)
-- [AstrBot Plugin Development Docs (English)](https://docs.astrbot.app/en/dev/star/plugin-new.html)
+## 📦 安装
+
+1. 克隆本插件到 AstrBot 的插件目录：
+```bash
+cd AstrBot/data/plugins/
+git clone https://github.com/yourusername/astrbot_plugin_QManagementMaster.git
+```
+
+2. 重启 AstrBot 或通过 WebUI 重载插件
+
+## ⚙️ 初始配置
+
+首次启动后，前往 **AstrBot WebUI > 插件管理 > QManagementMaster > 配置**：
+
+### 1. 配置超管 (必须)
+
+在 WebUI 中添加超管 QQ 号到 `super_admins` 列表：
+
+![配置示例](https://via.placeholder.com/800x200?text=WebUI+Configuration+Panel)
+
+- 点击"添加项"按钮
+- 输入超管的 QQ 号
+- 点击"保存配置"
+
+### 2. 配置群网络拓扑（可选）
+
+你可以在 WebUI 中预先配置群网络，或者通过指令动态配置：
+
+**WebUI 配置方式**：
+- 在 `groups` 字典中添加新键（联动组名）
+- 设置"播报群"和"执行群列表"
+
+**指令配置方式**（推荐）：
+- `/g_join <组名>`：将当前群加入联动组的执行群列表
+- `/g_log <组名>`：将当前群设为该组的播报群
+
+## 📖 指令列表
+
+### 处罚类指令 (超管/群管可用)
+
+#### `/mute <目标> <分钟数> <原因>`
+禁言用户，在所有执行群中生效
+```
+/mute @张三 60 发广告
+/mute 123456789 30 刷屏
+```
+
+#### `/kick <目标> <原因> [-b]`
+踢出用户，加上 `-b` 参数会同时加入黑名单
+```
+/kick @张三 违规 -b
+/kick 123456789 恶意骚扰
+```
+
+#### `/warn <目标> <原因>`
+警告用户，不执行实质处罚，仅记录并通知
+```
+/warn @张三 注意言行
+```
+
+### 查询类指令 (超管/群管可用)
+
+#### `/record <目标>`
+查询用户的违规历史记录
+```
+/record @张三
+/record 123456789
+```
+
+#### `/undo <记录ID> <原因>`
+撤销处罚记录
+- 禁言：解除所有执行群的禁言
+- 踢出：从黑名单移除
+```
+/undo 42 误操作
+```
+
+### 网络管理指令 (仅超管可用)
+
+#### `/g_join <组名>`
+将当前群加入联动组
+```
+/g_join 主群网络
+```
+
+#### `/g_leave`
+将当前群从联动组移除
+```
+/g_leave
+```
+
+#### `/g_log <组名>`
+将当前群设为播报群
+```
+/g_log 主群网络
+```
+
+## 🔧 权限说明
+
+### 超管 (Super Admin)
+- 读取插件配置文件中的 `super_admins` 列表
+- 可执行所有指令，包括网络管理
+
+### 群管 (Admin)
+- 通过群角色判定 (`admin` 或 `owner`)
+- 可执行处罚、查询、撤销指令
+- 不可管理网络拓扑
+
+## 🗂️ 数据结构
+
+### 配置文件 (`group_manager_config.json`)
+```json
+{
+  "super_admins": ["QQ号1", "QQ号2"],
+  "groups": {
+    "联动组名": {
+      "播报群": "群号",
+      "执行群列表": ["群号1", "群号2"]
+    }
+  },
+  "blacklist": [
+    {
+      "qq": "QQ号",
+      "reason": "原因",
+      "time": "2026-06-17 10:00:00"
+    }
+  ]
+}
+```
+
+### 数据库 (`records.db`)
+- `id`：记录ID（自增主键）
+- `action_type`：操作类型 (mute/kick/warn)
+- `target_qq`：目标QQ号
+- `operator_qq`：操作者QQ号
+- `reason`：原因
+- `duration`：时长（仅禁言）
+- `timestamp`：时间戳
+- `status`：状态 (active/revoked)
+
+## 🚀 使用场景
+
+### 场景1：多群联动管理
+某社区有3个QQ群（主群、分群1、分群2），希望违规处理在所有群同步执行：
+
+1. 超管在3个群分别执行 `/g_join 社区网络`
+2. 超管在主群执行 `/g_log 社区网络`（设为播报群）
+3. 之后任何群管在任意群执行 `/kick @违规用户 广告 -b`
+4. 该用户会在3个群同时被踢出，并加入黑名单
+5. 主群收到播报通知
+
+### 场景2：黑名单自动拦截
+某用户被踢出并加入黑名单后，尝试重新加入任意执行群：
+- 插件自动监听 OneBot v11 的 `group_increase` 事件
+- 检测到该用户在黑名单中
+- 立即踢出并拒绝加群请求
+- 向播报群发送拦截通知
+
+**支持的协议端**：
+- ✅ Snowluma（OneBot v11）
+- ✅ NapCat（OneBot v11）
+- ✅ go-cqhttp（OneBot v11）
+- ✅ 其他实现了 OneBot v11 标准的协议端
+
+### 场景3：处罚记录查询与撤销
+群管发现某次禁言操作有误：
+1. 执行 `/record @用户` 查看历史记录
+2. 找到对应的记录ID（如 42）
+3. 执行 `/undo 42 误操作` 撤销处罚
+4. 用户在所有执行群解除禁言
+
+## ⚠️ 注意事项
+
+1. **首次使用必须配置超管**：在 AstrBot WebUI 的插件配置页面添加超管 QQ 号
+2. **权限要求**：机器人必须拥有群管理员权限才能执行踢人和禁言操作
+3. **平台兼容性**：
+   - ✅ 完全支持 OneBot v11 协议（Snowluma、NapCat、go-cqhttp 等）
+   - ✅ 黑名单自动拦截功能已适配 OneBot v11 的 `group_increase` 通知事件
+   - ⚠️ 其他平台需确认是否实现了 OneBot v11 标准
+4. **数据安全**：建议定期备份数据库文件 `data/plugin_data/QManagementMaster/records.db`
+5. **黑名单管理**：
+   - 可以在 WebUI 中查看和手动编辑黑名单
+   - 使用 `/kick -b` 自动添加到黑名单
+   - 黑名单用户尝试加群时会被自动踢出（需要机器人有管理员权限）
+
+## 🔄 版本历史
+
+### v1.0.0 (2026-06-17)
+- ✅ 初始版本发布
+- ✅ 支持禁言、踢人、警告功能
+- ✅ 支持多群联动
+- ✅ 支持黑名单自动拦截
+- ✅ 支持处罚记录查询和撤销
+
+## 📝 许可证
+
+本项目采用 MIT 许可证。
+
+## 🤝 贡献
+
+欢迎提交 Issue 和 Pull Request！
+
+## 📧 联系方式
+
+如有问题或建议，请通过 GitHub Issues 联系。
+
+---
+
+基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 开发
+

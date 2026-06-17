@@ -1,0 +1,2 @@
+# QManagementMaster 插件依赖
+# 本插件使用 AstrBot 内置的标准库，无需额外依赖
