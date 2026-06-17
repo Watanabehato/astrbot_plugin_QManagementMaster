@@ -5,7 +5,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, List
 
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult, listener
+from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, AstrBotConfig
 from astrbot.api.message_components import Plain, At
@@ -686,18 +686,35 @@ class GroupManagerPlugin(Star):
         await self.put_kv_data("groups", groups)
         yield event.plain_result(f"✅ 当前群已设为联动组 [{net_name}] 的播报群")
 
-    @listener.on_group_increase()
-    async def on_group_member_increase(self, event: AstrMessageEvent):
+    async def on_event(self, event: AstrMessageEvent):
         """
-        监听群成员增加事件，自动检查黑名单并踢出
+        监听所有事件，包括群成员增加事件
 
-        使用 @listener.on_group_increase() 装饰器监听成员加群事件
+        AstrBot 会自动调用此方法处理各类事件
         """
         try:
-            # 获取新成员信息
+            if not hasattr(event, 'message_obj'):
+                return
+
             message_obj = event.message_obj
 
-            # 尝试多种字段名（适配不同平台）
+            # 检查事件类型
+            # SnowLuma 协议
+            kind = getattr(message_obj, 'kind', None)
+            # OneBot v11 标准
+            post_type = getattr(message_obj, 'post_type', None)
+            notice_type = getattr(message_obj, 'notice_type', None)
+
+            # 判断是否为群成员增加事件
+            is_member_join = (
+                kind == "group_member_join" or
+                (post_type == "notice" and notice_type == "group_increase")
+            )
+
+            if not is_member_join:
+                return
+
+            # 获取新成员信息
             new_member_qq = None
             group_id = None
 
@@ -713,7 +730,6 @@ class GroupManagerPlugin(Star):
                 group_id = str(message_obj.groupId)
             elif hasattr(message_obj, 'group_id'):
                 group_id = str(message_obj.group_id)
-            # 从 unified_msg_origin 获取
             elif hasattr(event, 'unified_msg_origin'):
                 group_id = str(event.unified_msg_origin)
 
@@ -727,7 +743,7 @@ class GroupManagerPlugin(Star):
             await self.check_and_kick_blacklist(new_member_qq, group_id)
 
         except Exception as e:
-            logger.error(f"处理群成员增加事件失败: {e}", exc_info=True)
+            logger.error(f"处理事件失败: {e}", exc_info=True)
 
     async def check_and_kick_blacklist(self, new_member_qq: str, group_id: str):
         """
@@ -896,13 +912,6 @@ class GroupManagerPlugin(Star):
             await self.broadcast_to_log_group(net_name, broadcast_msg)
 
         yield event.plain_result(f"✅ 已将 QQ {target_qq} 从黑名单移除")
-
-    async def on_message(self, event: AstrMessageEvent):
-        """
-        兼容旧版本的消息监听方法
-        如果 @listener 装饰器不可用，可作为备用
-        """
-        pass
 
     async def terminate(self):
         """插件卸载时的清理"""
