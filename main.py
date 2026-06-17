@@ -339,8 +339,14 @@ class GroupManagerPlugin(Star):
                 "operator": operator_qq
             }
             blacklist = await self.get_kv_data("blacklist", [])
+            logger.info(f"[黑名单] 添加前，当前黑名单: {blacklist}")
             blacklist.append(blacklist_entry)
             await self.put_kv_data("blacklist", blacklist)
+            logger.info(f"[黑名单] 添加后，当前黑名单: {blacklist}")
+
+            # 验证是否保存成功
+            verify_blacklist = await self.get_kv_data("blacklist", [])
+            logger.info(f"[黑名单] 验证读取，黑名单内容: {verify_blacklist}")
 
         # 记录到数据库
         record_id = self.add_record("kick", target_qq, operator_qq, reason)
