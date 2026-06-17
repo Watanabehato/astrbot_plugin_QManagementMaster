@@ -12,7 +12,7 @@ from astrbot.api.message_components import Plain, At
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 
-@register("QManagementMaster", "YourName", "QQ多群联动违规管理插件", "1.0.0")
+@register("QManagementMaster", "Watanabehato", "QQ多群联动违规管理插件", "1.0.0")
 class GroupManagerPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -686,6 +686,7 @@ class GroupManagerPlugin(Star):
         await self.put_kv_data("groups", groups)
         yield event.plain_result(f"✅ 当前群已设为联动组 [{net_name}] 的播报群")
 
+    @filter.message_type("notice")
     async def on_notice(self, event: AstrMessageEvent):
         """
         处理通知类事件（notice）
