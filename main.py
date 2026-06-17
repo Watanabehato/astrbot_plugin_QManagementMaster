@@ -5,7 +5,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, List
 
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
+from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult, listener
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, AstrBotConfig
 from astrbot.api.message_components import Plain, At
@@ -335,12 +335,12 @@ class GroupManagerPlugin(Star):
             blacklist_entry = {
                 "qq": target_qq,
                 "reason": reason,
-                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "operator": operator_qq
             }
-            if "blacklist" not in self.config:
-                self.config["blacklist"] = []
-            self.config["blacklist"].append(blacklist_entry)
-            self.config.save_config()  # 使用 AstrBotConfig 的保存方法
+            blacklist = await self.get_kv_data("blacklist", [])
+            blacklist.append(blacklist_entry)
+            await self.put_kv_data("blacklist", blacklist)
 
         # 记录到数据库
         record_id = self.add_record("kick", target_qq, operator_qq, reason)
@@ -590,11 +590,12 @@ class GroupManagerPlugin(Star):
 
         elif action_type == "kick":
             # 从黑名单移除
-            self.config["blacklist"] = [
-                entry for entry in self.config.get("blacklist", [])
+            blacklist = await self.get_kv_data("blacklist", [])
+            blacklist = [
+                entry for entry in blacklist
                 if entry.get("qq") != target_qq
             ]
-            self.config.save_config()  # 使用 AstrBotConfig 的保存方法
+            await self.put_kv_data("blacklist", blacklist)
             success_count = 1
 
         # 播报
@@ -685,74 +686,52 @@ class GroupManagerPlugin(Star):
         await self.put_kv_data("groups", groups)
         yield event.plain_result(f"✅ 当前群已设为联动组 [{net_name}] 的播报群")
 
-    async def on_message(self, event: AstrMessageEvent):
+    @listener.on_group_increase()
+    async def on_group_member_increase(self, event: AstrMessageEvent):
         """
-        监听所有消息事件，包括通知事件
-        注意：此方法会被 AstrBot 自动调用，用于监听非命令消息
+        监听群成员增加事件，自动检查黑名单并踢出
+
+        使用 @listener.on_group_increase() 装饰器监听成员加群事件
         """
         try:
-            logger.debug(f"on_message 被调用: {type(event)}")
-
-            # 检查是否为通知事件
-            if not hasattr(event, 'message_obj'):
-                logger.debug("事件没有 message_obj 属性")
-                return
-
+            # 获取新成员信息
             message_obj = event.message_obj
-            logger.debug(f"message_obj 类型: {type(message_obj)}")
 
-            # 尝试获取事件类型
-            # SnowLuma 使用 kind 字段
-            kind = getattr(message_obj, 'kind', None)
-            logger.debug(f"kind: {kind}")
+            # 尝试多种字段名（适配不同平台）
+            new_member_qq = None
+            group_id = None
 
-            # OneBot v11 标准使用 post_type + notice_type
-            post_type = getattr(message_obj, 'post_type', None)
-            notice_type = getattr(message_obj, 'notice_type', None)
-            logger.debug(f"post_type: {post_type}, notice_type: {notice_type}")
+            # SnowLuma 协议
+            if hasattr(message_obj, 'userUin'):
+                new_member_qq = str(message_obj.userUin)
+            # OneBot v11 标准
+            elif hasattr(message_obj, 'user_id'):
+                new_member_qq = str(message_obj.user_id)
 
-            # 检查是否为群成员增加事件
-            # 方式1: SnowLuma 的 kind="group_member_join"
-            # 方式2: OneBot v11 标准 post_type="notice" + notice_type="group_increase"
-            is_member_join = (
-                kind == "group_member_join" or
-                (post_type == "notice" and notice_type == "group_increase")
-            )
+            # 群号
+            if hasattr(message_obj, 'groupId'):
+                group_id = str(message_obj.groupId)
+            elif hasattr(message_obj, 'group_id'):
+                group_id = str(message_obj.group_id)
+            # 从 unified_msg_origin 获取
+            elif hasattr(event, 'unified_msg_origin'):
+                group_id = str(event.unified_msg_origin)
 
-            if not is_member_join:
-                logger.debug(f"不是群成员增加事件，跳过")
+            if not new_member_qq or not group_id:
+                logger.warning(f"群成员增加事件缺少必要字段: user={new_member_qq}, group={group_id}")
                 return
 
-            # 提取事件信息
-            # SnowLuma 使用 userUin 和 groupId
-            user_id = getattr(message_obj, 'userUin', None) or getattr(message_obj, 'user_id', None)
-            group_id = getattr(message_obj, 'groupId', None) or getattr(message_obj, 'group_id', None)
-            logger.info(f"检测到群成员增加: user_id={user_id}, group_id={group_id}")
+            logger.info(f"检测到群成员增加: user_id={new_member_qq}, group_id={group_id}")
 
-            if not user_id or not group_id:
-                logger.warning(f"群成员增加事件缺少必要字段")
-                return
-
-            # 调用黑名单检查处理
-            await self.handle_group_member_increase(str(user_id), str(group_id))
+            # 检查黑名单
+            await self.check_and_kick_blacklist(new_member_qq, group_id)
 
         except Exception as e:
-            logger.error(f"处理消息事件失败: {e}")
+            logger.error(f"处理群成员增加事件失败: {e}", exc_info=True)
 
-    async def handle_group_member_increase(self, new_member_qq: str, group_id: str):
+    async def check_and_kick_blacklist(self, new_member_qq: str, group_id: str):
         """
-        处理成员加群事件，检查黑名单
-
-        当检测到新成员加入群时，自动检查黑名单并踢出违规用户。
-        此方法会被 on_message 自动调用（OneBot v11 group_increase 事件）。
-
-        OneBot v11 事件结构：
-        - post_type: notice
-        - notice_type: group_increase
-        - sub_type: approve (管理员同意) 或 invite (管理员邀请)
-        - user_id: 加入的成员QQ号
-        - group_id: 群号
-        - operator_id: 操作的管理员QQ号
+        检查新成员是否在黑名单中，如果在则踢出并拉黑
 
         参数：
             new_member_qq: 新加入成员的QQ号
@@ -760,58 +739,170 @@ class GroupManagerPlugin(Star):
         """
         try:
             # 检查黑名单
-            blacklist = self.config.get("blacklist", [])
+            blacklist = await self.get_kv_data("blacklist", [])
             blacklist_entry = None
+
             for entry in blacklist:
                 if entry.get("qq") == new_member_qq:
                     blacklist_entry = entry
                     break
 
             if not blacklist_entry:
+                logger.debug(f"用户 {new_member_qq} 不在黑名单中")
                 return
 
-            # 获取群网络
+            logger.warning(f"发现黑名单用户 {new_member_qq} 加入群 {group_id}")
+
+            # 获取群网络信息
             network_info = await self.get_group_network_async(group_id)
             if not network_info:
+                logger.info(f"群 {group_id} 未加入任何联动组，跳过黑名单拦截")
                 return
 
             net_name, net_config = network_info
 
-            # 踢出黑名单用户
-            try:
-                pure_gid = group_id.split(':')[-1] if ':' in group_id else group_id
-                platforms = self.context.platform_manager.get_insts()
-                kicked = False
+            # 踢出并拉黑
+            pure_gid = group_id.split(':')[-1] if ':' in group_id else group_id
+            platforms = self.context.platform_manager.get_insts()
+            kicked = False
 
-                for platform in platforms:
-                    if hasattr(platform, 'get_client'):
-                        client = platform.get_client()
-                        if client and hasattr(client, 'set_group_kick'):
-                            try:
-                                await client.set_group_kick(
-                                    group_id=int(pure_gid),
-                                    user_id=int(new_member_qq),
-                                    reject_add_request=True
-                                )
-                                kicked = True
-                                break
-                            except Exception as e:
-                                logger.debug(f"平台踢出黑名单用户失败: {e}")
-                                continue
+            for platform in platforms:
+                if hasattr(platform, 'get_client'):
+                    client = platform.get_client()
+                    if client and hasattr(client, 'set_group_kick'):
+                        try:
+                            await client.set_group_kick(
+                                group_id=int(pure_gid),
+                                user_id=int(new_member_qq),
+                                reject_add_request=True  # 拒绝再次加群（拉黑）
+                            )
+                            kicked = True
+                            logger.info(f"成功踢出并拉黑黑名单用户 {new_member_qq} (群 {group_id})")
+                            break
+                        except Exception as e:
+                            logger.debug(f"平台踢出黑名单用户失败: {e}")
+                            continue
 
-                if kicked:
-                    # 播报拦截
-                    broadcast_msg = f"🚫 【黑名单拦截】\n目标: {new_member_qq}\n群: {group_id}\n原因: {blacklist_entry.get('reason', '未知')}\n加入黑名单时间: {blacklist_entry.get('time', '未知')}"
-                    await self.broadcast_to_log_group(net_name, broadcast_msg)
-                    logger.info(f"已拦截黑名单用户 {new_member_qq} 加入群 {group_id}")
-                else:
-                    logger.warning(f"未能踢出黑名单用户 {new_member_qq} (群 {group_id})")
-
-            except Exception as e:
-                logger.error(f"拦截黑名单用户失败: {e}")
+            if kicked:
+                # 播报拦截信息
+                broadcast_msg = (
+                    f"🚫 【黑名单自动拦截】\n"
+                    f"目标QQ: {new_member_qq}\n"
+                    f"拦截群: {group_id}\n"
+                    f"原处罚原因: {blacklist_entry.get('reason', '未知')}\n"
+                    f"加入黑名单时间: {blacklist_entry.get('time', '未知')}\n"
+                    f"原操作者: {blacklist_entry.get('operator', '未知')}\n"
+                    f"已执行: 踢出 + 拉黑（禁止再次加群）"
+                )
+                await self.broadcast_to_log_group(net_name, broadcast_msg)
+                logger.info(f"黑名单拦截成功: {new_member_qq} 已从群 {group_id} 移除并拉黑")
+            else:
+                logger.error(f"黑名单拦截失败: 无法踢出用户 {new_member_qq} (群 {group_id})")
+                # 播报失败信息
+                broadcast_msg = (
+                    f"⚠️ 【黑名单拦截失败】\n"
+                    f"目标QQ: {new_member_qq}\n"
+                    f"群: {group_id}\n"
+                    f"原因: {blacklist_entry.get('reason', '未知')}\n"
+                    f"状态: 检测到黑名单用户加群，但踢出失败（可能权限不足）"
+                )
+                await self.broadcast_to_log_group(net_name, broadcast_msg)
 
         except Exception as e:
-            logger.error(f"处理加群事件失败: {e}")
+            logger.error(f"检查黑名单并踢出失败: {e}", exc_info=True)
+
+    @filter.command("blacklist")
+    async def cmd_blacklist(self, event: AstrMessageEvent):
+        """查看黑名单: /blacklist [页码]"""
+        if not self.check_permission(event):
+            yield event.plain_result("❌ 权限不足，操作取消")
+            return
+
+        parts = event.message_str.strip().split()
+        page = 1
+        if len(parts) >= 2 and parts[1].isdigit():
+            page = int(parts[1])
+
+        blacklist = await self.get_kv_data("blacklist", [])
+
+        if not blacklist:
+            yield event.plain_result("📋 黑名单为空")
+            return
+
+        # 分页显示
+        page_size = 10
+        total_pages = (len(blacklist) + page_size - 1) // page_size
+        page = max(1, min(page, total_pages))
+
+        start = (page - 1) * page_size
+        end = start + page_size
+        page_data = blacklist[start:end]
+
+        result = f"📋 黑名单 (第 {page}/{total_pages} 页，共 {len(blacklist)} 人)\n\n"
+        for idx, entry in enumerate(page_data, start=start+1):
+            result += (
+                f"{idx}. QQ: {entry.get('qq')}\n"
+                f"   原因: {entry.get('reason', '未知')}\n"
+                f"   时间: {entry.get('time', '未知')}\n"
+                f"   操作者: {entry.get('operator', '未知')}\n"
+            )
+
+        if total_pages > 1:
+            result += f"\n使用 /blacklist {page+1} 查看下一页"
+
+        yield event.plain_result(result)
+
+    @filter.command("unblacklist")
+    async def cmd_unblacklist(self, event: AstrMessageEvent):
+        """从黑名单移除: /unblacklist <QQ号>"""
+        if not self.check_permission(event, require_super=True):
+            yield event.plain_result("❌ 权限不足，仅超管可用")
+            return
+
+        parts = event.message_str.strip().split()
+        if len(parts) < 2:
+            yield event.plain_result("❌ 参数不足\n用法: /unblacklist <QQ号>")
+            return
+
+        target_qq = parts[1]
+        if not target_qq.isdigit():
+            yield event.plain_result("❌ QQ号必须为数字")
+            return
+
+        blacklist = await self.get_kv_data("blacklist", [])
+        original_count = len(blacklist)
+
+        blacklist = [entry for entry in blacklist if entry.get("qq") != target_qq]
+
+        if len(blacklist) == original_count:
+            yield event.plain_result(f"❌ QQ {target_qq} 不在黑名单中")
+            return
+
+        await self.put_kv_data("blacklist", blacklist)
+
+        operator_qq = str(event.message_obj.sender.user_id)
+        group_id = str(event.unified_msg_origin)
+
+        # 播报
+        network_info = await self.get_group_network_async(group_id)
+        if network_info:
+            net_name, _ = network_info
+            broadcast_msg = (
+                f"✅ 【黑名单移除】\n"
+                f"目标QQ: {target_qq}\n"
+                f"操作者: {operator_qq}\n"
+                f"备注: 该用户已从黑名单移除，可正常加群"
+            )
+            await self.broadcast_to_log_group(net_name, broadcast_msg)
+
+        yield event.plain_result(f"✅ 已将 QQ {target_qq} 从黑名单移除")
+
+    async def on_message(self, event: AstrMessageEvent):
+        """
+        兼容旧版本的消息监听方法
+        如果 @listener 装饰器不可用，可作为备用
+        """
+        pass
 
     async def terminate(self):
         """插件卸载时的清理"""

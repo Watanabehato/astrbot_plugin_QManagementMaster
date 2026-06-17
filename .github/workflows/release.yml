@@ -1,0 +1,50 @@
+name: Release Plugin
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Get version from tag
+      id: get_version
+      run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+    - name: Create plugin zip
+      run: |
+        mkdir -p release
+        zip -r release/astrbot_plugin_QManagementMaster-${{ steps.get_version.outputs.VERSION }}.zip \
+          main.py \
+          metadata.yaml \
+          requirements.txt \
+          icon.png \
+          _conf_schema.json \
+          README.md \
+          LICENSE \
+          -x "*.pyc" -x "__pycache__/*" -x ".git/*"
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: release/*.zip
+        body: |
+          ## 📦 Release ${{ steps.get_version.outputs.VERSION }}
+
+          ### 安装方式
+          1. 下载 `astrbot_plugin_QManagementMaster-${{ steps.get_version.outputs.VERSION }}.zip`
+          2. 解压到 AstrBot 的 plugins 目录
+          3. 重启 AstrBot
+
+          ### 更新内容
+          请查看 [提交历史](https://github.com/${{ github.repository }}/commits/${{ steps.get_version.outputs.VERSION }})
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
