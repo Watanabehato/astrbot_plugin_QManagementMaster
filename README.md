@@ -15,7 +15,7 @@
 1. 克隆本插件到 AstrBot 的插件目录：
 ```bash
 cd AstrBot/data/plugins/
-git clone https://github.com/yourusername/astrbot_plugin_QManagementMaster.git
+git clone https://github.com/Watanabehato/astrbot_plugin_QManagementMaster.git
 ```
 
 2. 重启 AstrBot 或通过 WebUI 重载插件
@@ -197,6 +197,16 @@ git clone https://github.com/yourusername/astrbot_plugin_QManagementMaster.git
 
 ## 🔄 版本历史
 
+### v1.1.1 (2026-06-17)
+- 🐛 修复 Release CI 的 403 权限错误（补 `contents: write`）
+- 🐛 修复发布包缺失图标文件（`icon.png` → `logo.png`）
+
+### v1.1.0 (2026-06-17)
+- ✨ 黑名单添加去重：同一 QQ 已存在时更新原因/时间/操作者，不再产生重复条目
+- 🧹 清理黑名单拦截流程的调试日志
+- 🔧 修复黑名单拦截的群号匹配和踢人逻辑
+- 🔧 参考 github_star_verify 插件重写事件处理逻辑
+
 ### v1.0.0 (2026-06-17)
 - ✅ 初始版本发布
 - ✅ 支持禁言、踢人、警告功能
@@ -215,6 +225,11 @@ git clone https://github.com/yourusername/astrbot_plugin_QManagementMaster.git
 ## 📧 联系方式
 
 如有问题或建议，请通过 GitHub Issues 联系。
+
+## 🙏 致谢
+
+- [AstrBot](https://github.com/AstrBotDevs/AstrBot) — 本插件基于其框架开发
+- [astrbot_plugin_github_star_verify](https://github.com/ShadowLemoon/astrbot_plugin_github_star_verify) — 事件处理逻辑参考了该插件的实现
 
 ---
 
