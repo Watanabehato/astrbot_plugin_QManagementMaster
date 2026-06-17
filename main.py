@@ -34,25 +34,6 @@ class GroupManagerPlugin(Star):
             await self.put_kv_data("groups", {})
             logger.info("已初始化空的群网络配置")
 
-        # 注册原始事件监听器（直接在平台客户端层面）
-        try:
-            platforms = self.context.platform_manager.get_insts()
-            for platform in platforms:
-                if hasattr(platform, 'get_client'):
-                    client = platform.get_client()
-                    if client:
-                        # OneBot v11 客户端通常有 on 方法来注册事件监听
-                        if hasattr(client, 'on'):
-                            # 注册群成员增加事件监听
-                            client.on('notice.group_increase', self._on_member_join)
-                            logger.info(f"[黑名单拦截] 已在平台 {type(platform).__name__} 注册群成员增加事件监听")
-                        elif hasattr(client, 'subscribe'):
-                            # 某些客户端使用 subscribe 方法
-                            client.subscribe('group_member_join', self._on_member_join)
-                            logger.info(f"[黑名单拦截] 已在平台 {type(platform).__name__} 注册群成员增加事件监听（subscribe）")
-        except Exception as e:
-            logger.warning(f"[黑名单拦截] 注册事件监听器失败: {e}")
-
         logger.info("GroupManager 插件初始化完成")
 
     def init_database(self):
@@ -705,95 +686,43 @@ class GroupManagerPlugin(Star):
         await self.put_kv_data("groups", groups)
         yield event.plain_result(f"✅ 当前群已设为联动组 [{net_name}] 的播报群")
 
-    async def _on_member_join(self, event_data):
+    async def on_notice(self, event: AstrMessageEvent):
         """
-        原始事件监听器：处理群成员增加事件
+        处理通知类事件（notice）
 
-        直接在平台客户端层面注册，接收原始事件数据
-        """
-        try:
-            logger.info(f"[黑名单拦截] _on_member_join 被触发！事件数据: {event_data}")
-
-            # 提取 user_id 和 group_id
-            user_id = event_data.get('user_id') or event_data.get('userUin')
-            group_id = event_data.get('group_id') or event_data.get('groupId')
-
-            if user_id and group_id:
-                logger.info(f"[黑名单拦截] 检测到新成员: {user_id} 加入群 {group_id}")
-                await self.check_and_kick_blacklist(str(user_id), str(group_id))
-            else:
-                logger.warning(f"[黑名单拦截] 事件数据缺少必要字段: {event_data}")
-
-        except Exception as e:
-            logger.error(f"[黑名单拦截] 处理原始事件失败: {e}", exc_info=True)
-
-    @filter.on()
-    async def on_all_events(self, event: AstrMessageEvent):
-        """
-        监听所有事件，包括群成员增加事件
-
-        使用 @filter.on() 装饰器捕获所有事件（备用方案）
+        这是 AstrBot Star 插件的标准钩子，用于处理 OneBot v11 的通知事件
         """
         try:
-            logger.debug(f"[黑名单拦截] on_all_events 被调用，事件类型: {type(event)}")
-
             if not hasattr(event, 'message_obj'):
-                logger.debug(f"[黑名单拦截] 事件没有 message_obj 属性")
                 return
 
             message_obj = event.message_obj
-            logger.debug(f"[黑名单拦截] message_obj 类型: {type(message_obj)}, 属性: {dir(message_obj)}")
 
-            # 检查事件类型
-            # SnowLuma 协议
-            kind = getattr(message_obj, 'kind', None)
-            # OneBot v11 标准
+            # 获取事件类型
             post_type = getattr(message_obj, 'post_type', None)
             notice_type = getattr(message_obj, 'notice_type', None)
 
-            logger.info(f"[黑名单拦截] kind={kind}, post_type={post_type}, notice_type={notice_type}")
+            logger.info(f"[黑名单拦截] on_notice 被调用: post_type={post_type}, notice_type={notice_type}")
 
-            # 判断是否为群成员增加事件
-            is_member_join = (
-                kind == "group_member_join" or
-                (post_type == "notice" and notice_type == "group_increase")
-            )
-
-            if not is_member_join:
+            # 只处理群成员增加事件
+            if post_type != 'notice' or notice_type != 'group_increase':
                 return
 
-            logger.info(f"[黑名单拦截] ✅ 检测到群成员增加事件！")
+            # 提取信息
+            user_id = getattr(message_obj, 'user_id', None)
+            group_id = getattr(message_obj, 'group_id', None)
 
-            # 获取新成员信息
-            new_member_qq = None
-            group_id = None
-
-            # SnowLuma 协议
-            if hasattr(message_obj, 'userUin'):
-                new_member_qq = str(message_obj.userUin)
-            # OneBot v11 标准
-            elif hasattr(message_obj, 'user_id'):
-                new_member_qq = str(message_obj.user_id)
-
-            # 群号
-            if hasattr(message_obj, 'groupId'):
-                group_id = str(message_obj.groupId)
-            elif hasattr(message_obj, 'group_id'):
-                group_id = str(message_obj.group_id)
-            elif hasattr(event, 'unified_msg_origin'):
-                group_id = str(event.unified_msg_origin)
-
-            if not new_member_qq or not group_id:
-                logger.warning(f"[黑名单拦截] 群成员增加事件缺少必要字段: user={new_member_qq}, group={group_id}")
+            if not user_id or not group_id:
+                logger.warning(f"[黑名单拦截] 群成员增加事件缺少必要字段")
                 return
 
-            logger.info(f"[黑名单拦截] 检测到群成员增加: user_id={new_member_qq}, group_id={group_id}")
+            logger.info(f"[黑名单拦截] ✅ 检测到群成员增加: user_id={user_id}, group_id={group_id}")
 
             # 检查黑名单
-            await self.check_and_kick_blacklist(new_member_qq, group_id)
+            await self.check_and_kick_blacklist(str(user_id), str(group_id))
 
         except Exception as e:
-            logger.error(f"[黑名单拦截] 处理事件失败: {e}", exc_info=True)
+            logger.error(f"[黑名单拦截] 处理通知事件失败: {e}", exc_info=True)
 
     async def check_and_kick_blacklist(self, new_member_qq: str, group_id: str):
         """
