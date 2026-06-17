@@ -343,21 +343,21 @@ class GroupManagerPlugin(Star):
 
         # 添加黑名单
         if add_blacklist:
-            blacklist_entry = {
-                "qq": target_qq,
-                "reason": reason,
-                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "operator": operator_qq
-            }
             blacklist = await self.get_kv_data("blacklist", [])
-            logger.info(f"[黑名单] 添加前，当前黑名单: {blacklist}")
-            blacklist.append(blacklist_entry)
+            # 去重：若该 QQ 已在黑名单中，更新原因/时间/操作者，避免重复条目
+            existing = next((e for e in blacklist if str(e.get("qq")) == target_qq), None)
+            if existing:
+                existing["reason"] = reason
+                existing["time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                existing["operator"] = operator_qq
+            else:
+                blacklist.append({
+                    "qq": target_qq,
+                    "reason": reason,
+                    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "operator": operator_qq
+                })
             await self.put_kv_data("blacklist", blacklist)
-            logger.info(f"[黑名单] 添加后，当前黑名单: {blacklist}")
-
-            # 验证是否保存成功
-            verify_blacklist = await self.get_kv_data("blacklist", [])
-            logger.info(f"[黑名单] 验证读取，黑名单内容: {verify_blacklist}")
 
         # 记录到数据库
         record_id = self.add_record("kick", target_qq, operator_qq, reason)
@@ -719,14 +719,11 @@ class GroupManagerPlugin(Star):
             raw = event.message_obj.raw_message
             post_type = raw.get("post_type")
 
-            logger.debug(f"[黑名单拦截] handle_event 被调用: post_type={post_type}")
-
             # 只处理通知类型事件
             if post_type != "notice":
                 return
 
             notice_type = raw.get("notice_type")
-            logger.info(f"[黑名单拦截] 收到通知事件: notice_type={notice_type}")
 
             # 只处理群成员增加事件
             if notice_type != "group_increase":
@@ -737,10 +734,10 @@ class GroupManagerPlugin(Star):
             group_id = raw.get("group_id")
 
             if not user_id or not group_id:
-                logger.warning(f"[黑名单拦截] 群成员增加事件缺少必要字段")
+                logger.warning("[黑名单拦截] 群成员增加事件缺少必要字段")
                 return
 
-            logger.info(f"[黑名单拦截] ✅ 检测到群成员增加: user_id={user_id}, group_id={group_id}")
+            logger.info(f"[黑名单拦截] 检测到群成员增加: user_id={user_id}, group_id={group_id}")
 
             # 检查黑名单
             await self.check_and_kick_blacklist(str(user_id), str(group_id))
@@ -759,20 +756,14 @@ class GroupManagerPlugin(Star):
         try:
             # 检查黑名单
             blacklist = await self.get_kv_data("blacklist", [])
-            logger.info(f"[黑名单拦截] 当前黑名单: {blacklist}")
-            logger.info(f"[黑名单拦截] 检查用户: {new_member_qq} (类型: {type(new_member_qq)})")
 
             blacklist_entry = None
-
             for entry in blacklist:
-                entry_qq = str(entry.get("qq"))  # 确保转换为字符串
-                logger.debug(f"[黑名单拦截] 比对: {entry_qq} == {new_member_qq}")
-                if entry_qq == new_member_qq:
+                if str(entry.get("qq")) == new_member_qq:
                     blacklist_entry = entry
                     break
 
             if not blacklist_entry:
-                logger.debug(f"[黑名单拦截] 用户 {new_member_qq} 不在黑名单中")
                 return
 
             logger.warning(f"发现黑名单用户 {new_member_qq} 加入群 {group_id}")
