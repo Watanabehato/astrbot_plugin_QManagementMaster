@@ -742,15 +742,20 @@ class GroupManagerPlugin(Star):
         try:
             # 检查黑名单
             blacklist = await self.get_kv_data("blacklist", [])
+            logger.info(f"[黑名单拦截] 当前黑名单: {blacklist}")
+            logger.info(f"[黑名单拦截] 检查用户: {new_member_qq} (类型: {type(new_member_qq)})")
+
             blacklist_entry = None
 
             for entry in blacklist:
-                if entry.get("qq") == new_member_qq:
+                entry_qq = str(entry.get("qq"))  # 确保转换为字符串
+                logger.debug(f"[黑名单拦截] 比对: {entry_qq} == {new_member_qq}")
+                if entry_qq == new_member_qq:
                     blacklist_entry = entry
                     break
 
             if not blacklist_entry:
-                logger.debug(f"用户 {new_member_qq} 不在黑名单中")
+                logger.debug(f"[黑名单拦截] 用户 {new_member_qq} 不在黑名单中")
                 return
 
             logger.warning(f"发现黑名单用户 {new_member_qq} 加入群 {group_id}")
