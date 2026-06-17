@@ -34,6 +34,25 @@ class GroupManagerPlugin(Star):
             await self.put_kv_data("groups", {})
             logger.info("已初始化空的群网络配置")
 
+        # 注册原始事件监听器（直接在平台客户端层面）
+        try:
+            platforms = self.context.platform_manager.get_insts()
+            for platform in platforms:
+                if hasattr(platform, 'get_client'):
+                    client = platform.get_client()
+                    if client:
+                        # OneBot v11 客户端通常有 on 方法来注册事件监听
+                        if hasattr(client, 'on'):
+                            # 注册群成员增加事件监听
+                            client.on('notice.group_increase', self._on_member_join)
+                            logger.info(f"[黑名单拦截] 已在平台 {type(platform).__name__} 注册群成员增加事件监听")
+                        elif hasattr(client, 'subscribe'):
+                            # 某些客户端使用 subscribe 方法
+                            client.subscribe('group_member_join', self._on_member_join)
+                            logger.info(f"[黑名单拦截] 已在平台 {type(platform).__name__} 注册群成员增加事件监听（subscribe）")
+        except Exception as e:
+            logger.warning(f"[黑名单拦截] 注册事件监听器失败: {e}")
+
         logger.info("GroupManager 插件初始化完成")
 
     def init_database(self):
@@ -686,12 +705,34 @@ class GroupManagerPlugin(Star):
         await self.put_kv_data("groups", groups)
         yield event.plain_result(f"✅ 当前群已设为联动组 [{net_name}] 的播报群")
 
+    async def _on_member_join(self, event_data):
+        """
+        原始事件监听器：处理群成员增加事件
+
+        直接在平台客户端层面注册，接收原始事件数据
+        """
+        try:
+            logger.info(f"[黑名单拦截] _on_member_join 被触发！事件数据: {event_data}")
+
+            # 提取 user_id 和 group_id
+            user_id = event_data.get('user_id') or event_data.get('userUin')
+            group_id = event_data.get('group_id') or event_data.get('groupId')
+
+            if user_id and group_id:
+                logger.info(f"[黑名单拦截] 检测到新成员: {user_id} 加入群 {group_id}")
+                await self.check_and_kick_blacklist(str(user_id), str(group_id))
+            else:
+                logger.warning(f"[黑名单拦截] 事件数据缺少必要字段: {event_data}")
+
+        except Exception as e:
+            logger.error(f"[黑名单拦截] 处理原始事件失败: {e}", exc_info=True)
+
     @filter.on()
     async def on_all_events(self, event: AstrMessageEvent):
         """
         监听所有事件，包括群成员增加事件
 
-        使用 @filter.on() 装饰器捕获所有事件
+        使用 @filter.on() 装饰器捕获所有事件（备用方案）
         """
         try:
             logger.debug(f"[黑名单拦截] on_all_events 被调用，事件类型: {type(event)}")
