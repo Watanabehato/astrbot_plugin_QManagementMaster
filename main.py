@@ -12,13 +12,15 @@ from astrbot.api.message_components import Plain, At
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 
-@register("QManagementMaster", "Watanabehato", "QQ多群联动违规管理插件", "1.0.0")
+@register("QManagementMaster", "Watanabehato", "QQ多群联动违规管理插件", "1.2.1")
 class GroupManagerPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config  # 使用 AstrBot 配置系统
         self.data_dir = Path(get_astrbot_data_path()) / "plugin_data" / "QManagementMaster"
         self.db_path = self.data_dir / "records.db"
+        self._groups_lock = asyncio.Lock()
+        self._blacklist_lock = asyncio.Lock()
 
     async def initialize(self):
         """插件初始化：创建目录和数据库"""
@@ -28,13 +30,79 @@ class GroupManagerPlugin(Star):
         # 初始化数据库
         self.init_database()
 
-        # 初始化 groups 配置（使用 KV 存储）
-        groups = await self.get_kv_data("groups", {})
-        if not groups:
-            await self.put_kv_data("groups", {})
-            logger.info("已初始化空的群网络配置")
+        # 迁移旧的 KV groups 数据到插件配置
+        old_groups = await self.get_kv_data("groups", {})
+        if old_groups and isinstance(old_groups, dict) and len(old_groups) > 0:
+            new_groups = []
+            for name, cfg in old_groups.items():
+                if not isinstance(cfg, dict):
+                    continue
+                new_groups.append({
+                    "name": name,
+                    "log_group": cfg.get("播报群", ""),
+                    "exec_groups": cfg.get("执行群列表", [])
+                })
+            if new_groups:
+                self.config["groups"] = new_groups
+                self.config.save_config()
+                await self.put_kv_data("groups", {})
+                logger.info(f"已迁移 {len(new_groups)} 个联动组到插件配置")
+
+        # 迁移旧的 KV blacklist 数据到插件配置
+        old_blacklist = await self.get_kv_data("blacklist", [])
+        if old_blacklist and isinstance(old_blacklist, list) and len(old_blacklist) > 0:
+            migrated = []
+            for entry in old_blacklist:
+                if isinstance(entry, dict):
+                    migrated.append({
+                        "qq": str(entry.get("qq", "")),
+                        "reason": entry.get("reason", ""),
+                        "time": entry.get("time", ""),
+                        "operator": entry.get("operator", "")
+                    })
+            if migrated:
+                self.config["blacklist"] = migrated
+                self.config.save_config()
+                await self.put_kv_data("blacklist", [])
+                logger.info(f"已迁移 {len(migrated)} 条黑名单到插件配置")
 
         logger.info("GroupManager 插件初始化完成")
+
+    def _get_groups(self) -> list:
+        groups = self.config.get("groups", [])
+        if not isinstance(groups, list):
+            return []
+        return groups
+
+    def _save_groups(self, groups: list):
+        self.config["groups"] = groups
+        self.config.save_config()
+
+    def _get_blacklist(self) -> list:
+        blacklist = self.config.get("blacklist", [])
+        if not isinstance(blacklist, list):
+            return []
+        return blacklist
+
+    def _save_blacklist(self, blacklist: list):
+        self.config["blacklist"] = blacklist
+        self.config.save_config()
+
+    @staticmethod
+    def _pure_gid(group_id: str) -> str:
+        return group_id.split(':')[-1] if ':' in group_id else group_id
+
+    @staticmethod
+    def _parse_duration(raw: str) -> int:
+        """解析时长字符串，返回分钟数。支持 1m/1h/1d 或纯数字"""
+        raw = raw.strip().lower()
+        if raw.endswith('m'):
+            return int(raw[:-1])
+        if raw.endswith('h'):
+            return int(raw[:-1]) * 60
+        if raw.endswith('d'):
+            return int(raw[:-1]) * 1440
+        return int(raw)
 
     def init_database(self):
         """初始化 SQLite 数据库"""
@@ -94,70 +162,17 @@ class GroupManagerPlugin(Star):
 
         return None
 
-    def get_group_network(self, group_id: str) -> Optional[tuple]:
-        """获取群所属的网络组，返回 (组名, 配置)"""
-        # 同步获取 KV 数据需要在异步上下文中调用
-        # 这里我们使用一个辅助方法
-        import asyncio
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # 如果在异步上下文中，创建一个 task
-                return None  # 临时返回，需要改为异步方法
-            else:
-                groups = loop.run_until_complete(self.get_kv_data("groups", {}))
-        except:
-            return None
-
-        if not isinstance(groups, dict):
-            logger.error(f"groups 配置格式错误: {type(groups)}")
-            return None
-
-        for net_name, net_config in groups.items():
-            if not isinstance(net_config, dict):
-                logger.error(f"网络配置 {net_name} 格式错误: {type(net_config)}")
-                continue
-
-            exec_list = net_config.get("执行群列表", [])
-            if not isinstance(exec_list, list):
-                logger.error(f"执行群列表格式错误: {type(exec_list)}")
-                continue
-
-            if group_id in exec_list:
-                return net_name, net_config
-        return None
-
     async def get_group_network_async(self, group_id: str) -> Optional[tuple]:
-        """异步获取群所属的网络组，返回 (组名, 配置)
-
-        支持两种群号格式的匹配：
-        - 完整格式: aiocqhttp:GroupMessage:1101147419
-        - 纯群号: 1101147419
-        """
-        groups = await self.get_kv_data("groups", {})
-
-        if not isinstance(groups, dict):
-            logger.error(f"groups 配置格式错误: {type(groups)}")
-            return None
-
-        # 提取传入群号的纯群号部分
-        pure_gid = group_id.split(':')[-1] if ':' in group_id else group_id
-
-        for net_name, net_config in groups.items():
-            if not isinstance(net_config, dict):
-                logger.error(f"网络配置 {net_name} 格式错误: {type(net_config)}")
+        """获取群所属的网络组，返回 (组名, 组配置dict)
+        支持完整格式和纯群号匹配"""
+        groups = self._get_groups()
+        pure_gid = self._pure_gid(group_id)
+        for g in groups:
+            if not isinstance(g, dict):
                 continue
-
-            exec_list = net_config.get("执行群列表", [])
-            if not isinstance(exec_list, list):
-                logger.error(f"执行群列表格式错误: {type(exec_list)}")
-                continue
-
-            # 同时支持完整格式和纯群号匹配
-            for exec_gid in exec_list:
-                exec_pure = exec_gid.split(':')[-1] if ':' in exec_gid else exec_gid
-                if exec_gid == group_id or exec_pure == pure_gid:
-                    return net_name, net_config
+            for exec_gid in g.get("exec_groups", []):
+                if self._pure_gid(str(exec_gid)) == pure_gid:
+                    return g.get("name", ""), g
         return None
 
     def add_record(self, action_type: str, target_qq: str, operator_qq: str,
@@ -179,12 +194,16 @@ class GroupManagerPlugin(Star):
 
     async def broadcast_to_log_group(self, net_name: str, message: str):
         """向播报群发送消息"""
-        groups = await self.get_kv_data("groups", {})
-        net_config = groups.get(net_name)
-        if not net_config or not isinstance(net_config, dict):
+        groups = self._get_groups()
+        net_config = None
+        for g in groups:
+            if g.get("name") == net_name:
+                net_config = g
+                break
+        if not net_config:
             return
 
-        log_group = net_config.get("播报群")
+        log_group = net_config.get("log_group", "")
         if not log_group:
             return
 
@@ -209,7 +228,7 @@ class GroupManagerPlugin(Star):
 
     @filter.command("mute")
     async def cmd_mute(self, event: AstrMessageEvent):
-        """禁言指令: /mute <目标> <分钟数> <原因>"""
+        """禁言指令: /mute <目标> <时长> <原因>"""
         if not self.check_permission(event):
             yield event.plain_result("❌ 权限不足，操作取消")
             return
@@ -217,7 +236,7 @@ class GroupManagerPlugin(Star):
         # 解析参数
         parts = event.message_str.strip().split(maxsplit=3)
         if len(parts) < 4:
-            yield event.plain_result("❌ 参数不足\n用法: /mute <目标> <分钟数> <原因>")
+            yield event.plain_result("❌ 参数不足\n用法: /mute <目标> <时长> <原因>\n时长格式: 30m(分钟) / 2h(小时) / 1d(天) / 纯数字(分钟)")
             return
 
         target_qq = self.extract_target_qq(event)
@@ -226,9 +245,9 @@ class GroupManagerPlugin(Star):
             return
 
         try:
-            duration = int(parts[2])
+            duration = self._parse_duration(parts[2])
         except ValueError:
-            yield event.plain_result("❌ 时长必须为整数")
+            yield event.plain_result("❌ 时长格式错误，支持: 30m(分钟) / 2h(小时) / 1d(天) / 纯数字(分钟)")
             return
 
         reason = parts[3]
@@ -246,70 +265,58 @@ class GroupManagerPlugin(Star):
             return
 
         net_name, net_config = network_info
-        exec_groups = net_config.get("执行群列表", [])
+        exec_groups = net_config.get("exec_groups", [])
+
+        # 在当前群执行禁言
+        pure_gid = group_id.split(':')[-1] if ':' in group_id else group_id
+        last_error = ""
+        platforms = self.context.platform_manager.get_insts()
+        for platform in platforms:
+            if hasattr(platform, 'get_client'):
+                client = platform.get_client()
+                if client and hasattr(client, 'set_group_ban'):
+                    try:
+                        await client.set_group_ban(
+                            group_id=int(pure_gid),
+                            user_id=int(target_qq),
+                            duration=duration * 60
+                        )
+                        break
+                    except Exception as e:
+                        last_error = str(e)
+                        logger.warning(f"禁言失败: {e}")
+                        continue
+                elif client and hasattr(client, 'call_api'):
+                    try:
+                        await client.call_api(
+                            'set_group_ban',
+                            group_id=int(pure_gid),
+                            user_id=int(target_qq),
+                            duration=duration * 60
+                        )
+                        break
+                    except Exception as e:
+                        last_error = str(e)
+                        logger.warning(f"禁言失败: {e}")
+                        continue
+        else:
+            yield event.plain_result(f"❌ 禁言失败\n{last_error}")
+            return
 
         # 记录到数据库
         record_id = self.add_record("mute", target_qq, operator_qq, reason, duration)
 
-        # 执行禁言 - 使用 AstrBot 的统一 API
-        success_count = 0
-        for gid in exec_groups:
-            try:
-                logger.info(f"尝试在群 {gid} 禁言用户 {target_qq}")
-
-                # 通过 context 获取所有平台实例
-                platforms = self.context.platform_manager.get_insts()
-                logger.info(f"可用平台数量: {len(platforms)}")
-
-                # 寻找能处理这个群的平台
-                for idx, platform in enumerate(platforms):
-                    logger.info(f"平台 {idx}: {type(platform).__name__}")
-
-                    try:
-                        # 提取纯群号（去除前缀）
-                        pure_gid = gid.split(':')[-1] if ':' in gid else gid
-                        logger.info(f"  - 尝试操作群 {pure_gid}")
-
-                        # 尝试方式1：通过 get_client() 获取客户端
-                        if hasattr(platform, 'get_client'):
-                            client = platform.get_client()
-                            logger.info(f"  - 获取到 client: {type(client).__name__}")
-
-                            if hasattr(client, 'set_group_ban'):
-                                await client.set_group_ban(
-                                    group_id=int(pure_gid),
-                                    user_id=int(target_qq),
-                                    duration=duration * 60
-                                )
-                                success_count += 1
-                                logger.info(f"群 {gid} 禁言成功（方式1：client.set_group_ban）")
-                                break
-                            elif hasattr(client, 'call_api'):
-                                await client.call_api(
-                                    'set_group_ban',
-                                    group_id=int(pure_gid),
-                                    user_id=int(target_qq),
-                                    duration=duration * 60
-                                )
-                                success_count += 1
-                                logger.info(f"群 {gid} 禁言成功（方式2：client.call_api）")
-                                break
-
-                    except Exception as e:
-                        logger.warning(f"  - 平台 {idx} 处理失败: {e}", exc_info=True)
-                        continue
-
-                if success_count == 0:
-                    logger.warning(f"未找到能处理群 {gid} 的平台")
-
-            except Exception as e:
-                logger.error(f"禁言失败 (群{gid}): {e}", exc_info=True)
-
         # 播报
-        broadcast_msg = f"【禁言通知】\n记录ID: {record_id}\n目标: {target_qq}\n时长: {duration}分钟\n原因: {reason}\n操作者: {operator_qq}\n执行群数: {success_count}/{len(exec_groups)}"
+        if duration >= 1440 and duration % 1440 == 0:
+            time_str = f"{duration // 1440}天"
+        elif duration >= 60 and duration % 60 == 0:
+            time_str = f"{duration // 60}小时"
+        else:
+            time_str = f"{duration}分钟"
+        broadcast_msg = f"【禁言通知】\n记录ID: {record_id}\n目标: {target_qq}\n时长: {time_str}\n原因: {reason}\n操作者: {operator_qq}\n执行群: {pure_gid}"
         await self.broadcast_to_log_group(net_name, broadcast_msg)
 
-        yield event.plain_result(f"✅ 禁言完成\n记录ID: {record_id}\n成功执行: {success_count}/{len(exec_groups)}个群")
+        yield event.plain_result(f"✅ 禁言完成\n记录ID: {record_id}")
 
     @filter.command("kick")
     async def cmd_kick(self, event: AstrMessageEvent):
@@ -339,62 +346,71 @@ class GroupManagerPlugin(Star):
             return
 
         net_name, net_config = network_info
-        exec_groups = net_config.get("执行群列表", [])
+        exec_groups = net_config.get("exec_groups", [])
+
+        # 在当前群执行踢出
+        pure_gid = group_id.split(':')[-1] if ':' in group_id else group_id
+        last_error = ""
+        platforms = self.context.platform_manager.get_insts()
+        for platform in platforms:
+            if hasattr(platform, 'get_client'):
+                client = platform.get_client()
+                if client and hasattr(client, 'set_group_kick'):
+                    try:
+                        await client.set_group_kick(
+                            group_id=int(pure_gid),
+                            user_id=int(target_qq),
+                            reject_add_request=add_blacklist
+                        )
+                        break
+                    except Exception as e:
+                        last_error = str(e)
+                        logger.warning(f"踢人失败: {e}")
+                        continue
+                elif client and hasattr(client, 'call_api'):
+                    try:
+                        await client.call_api(
+                            'set_group_kick',
+                            group_id=int(pure_gid),
+                            user_id=int(target_qq),
+                            reject_add_request=add_blacklist
+                        )
+                        break
+                    except Exception as e:
+                        last_error = str(e)
+                        logger.warning(f"踢人失败: {e}")
+                        continue
+        else:
+            yield event.plain_result(f"❌ 踢出失败\n{last_error}")
+            return
 
         # 添加黑名单
         if add_blacklist:
-            blacklist = await self.get_kv_data("blacklist", [])
-            # 去重：若该 QQ 已在黑名单中，更新原因/时间/操作者，避免重复条目
-            existing = next((e for e in blacklist if str(e.get("qq")) == target_qq), None)
-            if existing:
-                existing["reason"] = reason
-                existing["time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                existing["operator"] = operator_qq
-            else:
-                blacklist.append({
-                    "qq": target_qq,
-                    "reason": reason,
-                    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "operator": operator_qq
-                })
-            await self.put_kv_data("blacklist", blacklist)
+            async with self._blacklist_lock:
+                blacklist = self._get_blacklist()
+                existing = next((e for e in blacklist if str(e.get("qq")) == target_qq), None)
+                if existing:
+                    existing["reason"] = reason
+                    existing["time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    existing["operator"] = operator_qq
+                else:
+                    blacklist.append({
+                        "qq": target_qq,
+                        "reason": reason,
+                        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "operator": operator_qq
+                    })
+                self._save_blacklist(blacklist)
 
         # 记录到数据库
         record_id = self.add_record("kick", target_qq, operator_qq, reason)
 
-        # 执行踢出
-        success_count = 0
-        platforms = self.context.platform_manager.get_insts()
-        for gid in exec_groups:
-            try:
-                pure_gid = gid.split(':')[-1] if ':' in gid else gid
-                logger.info(f"尝试踢出用户 {target_qq} (群 {pure_gid})")
-
-                for platform in platforms:
-                    if hasattr(platform, 'get_client'):
-                        client = platform.get_client()
-                        if client and hasattr(client, 'set_group_kick'):
-                            try:
-                                await client.set_group_kick(
-                                    group_id=int(pure_gid),
-                                    user_id=int(target_qq),
-                                    reject_add_request=add_blacklist
-                                )
-                                success_count += 1
-                                logger.info(f"群 {gid} 踢人成功")
-                                break
-                            except Exception as e:
-                                logger.warning(f"平台处理群 {gid} 踢人失败: {e}")
-                                continue
-            except Exception as e:
-                logger.error(f"踢人失败 (群{gid}): {e}", exc_info=True)
-
         # 播报
         blacklist_text = "✅ 已加入黑名单" if add_blacklist else ""
-        broadcast_msg = f"【踢出通知】\n记录ID: {record_id}\n目标: {target_qq}\n原因: {reason}\n操作者: {operator_qq}\n执行群数: {success_count}/{len(exec_groups)}\n{blacklist_text}"
+        broadcast_msg = f"【踢出通知】\n记录ID: {record_id}\n目标: {target_qq}\n原因: {reason}\n操作者: {operator_qq}\n执行群: {pure_gid}\n{blacklist_text}"
         await self.broadcast_to_log_group(net_name, broadcast_msg)
 
-        result_text = f"✅ 踢出完成\n记录ID: {record_id}\n成功执行: {success_count}/{len(exec_groups)}个群"
+        result_text = f"✅ 踢出完成\n记录ID: {record_id}"
         if add_blacklist:
             result_text += "\n✅ 已加入黑名单"
         yield event.plain_result(result_text)
@@ -426,38 +442,38 @@ class GroupManagerPlugin(Star):
             return
 
         net_name, net_config = network_info
-        exec_groups = net_config.get("执行群列表", [])
+        exec_groups = net_config.get("exec_groups", [])
+
+        # 在当前群发送警告
+        warn_msg = f"⚠️ 警告\n用户: {target_qq}\n原因: {reason}\n操作者: {operator_qq}"
+
+        sent = False
+        pure_gid = group_id.split(':')[-1] if ':' in group_id else group_id
+        platforms = self.context.platform_manager.get_insts()
+        for platform in platforms:
+            if hasattr(platform, 'get_client'):
+                client = platform.get_client()
+                if client and hasattr(client, 'send_group_msg'):
+                    try:
+                        await client.send_group_msg(group_id=int(pure_gid), message=warn_msg)
+                        sent = True
+                        break
+                    except Exception as e:
+                        logger.debug(f"发送警告失败: {e}")
+                        continue
+
+        if not sent:
+            yield event.plain_result("❌ 发送警告失败，bot可能不在目标群或权限不足")
+            return
 
         # 记录到数据库
         record_id = self.add_record("warn", target_qq, operator_qq, reason)
 
-        # 在执行群发送警告
-        warn_msg = f"⚠️ 警告\n用户: {target_qq}\n原因: {reason}\n操作者: {operator_qq}"
-
-        success_count = 0
-        platforms = self.context.platform_manager.get_insts()
-        for gid in exec_groups:
-            try:
-                pure_gid = gid.split(':')[-1] if ':' in gid else gid
-                for platform in platforms:
-                    if hasattr(platform, 'get_client'):
-                        client = platform.get_client()
-                        if client and hasattr(client, 'send_group_msg'):
-                            try:
-                                await client.send_group_msg(group_id=int(pure_gid), message=warn_msg)
-                                success_count += 1
-                                break
-                            except Exception as e:
-                                logger.debug(f"平台发送警告失败: {e}")
-                                continue
-            except Exception as e:
-                logger.error(f"发送警告失败 (群{gid}): {e}")
-
         # 播报
-        broadcast_msg = f"【警告通知】\n记录ID: {record_id}\n目标: {target_qq}\n原因: {reason}\n操作者: {operator_qq}\n执行群数: {success_count}/{len(exec_groups)}"
+        broadcast_msg = f"【警告通知】\n记录ID: {record_id}\n目标: {target_qq}\n原因: {reason}\n操作者: {operator_qq}\n执行群: {pure_gid}"
         await self.broadcast_to_log_group(net_name, broadcast_msg)
 
-        yield event.plain_result(f"✅ 警告已发送\n记录ID: {record_id}\n成功执行: {success_count}/{len(exec_groups)}个群")
+        yield event.plain_result(f"✅ 警告已发送\n记录ID: {record_id}")
 
     @filter.command("record")
     async def cmd_record(self, event: AstrMessageEvent):
@@ -551,7 +567,7 @@ class GroupManagerPlugin(Star):
             return
 
         net_name, net_config = network_info
-        exec_groups = net_config.get("执行群列表", [])
+        exec_groups = net_config.get("exec_groups", [])
 
         # 查询记录
         conn = sqlite3.connect(str(self.db_path))
@@ -574,46 +590,57 @@ class GroupManagerPlugin(Star):
             yield event.plain_result(f"❌ 记录ID {record_id} 已被撤销")
             return
 
-        # 更新状态
-        cursor.execute('UPDATE records SET status = ? WHERE id = ?', ('revoked', record_id))
-        conn.commit()
         conn.close()
 
         # 执行撤销操作
-        success_count = 0
+        pure_gid = group_id.split(':')[-1] if ':' in group_id else group_id
         platforms = self.context.platform_manager.get_insts()
         if action_type == "mute":
-            # 解除禁言
-            for gid in exec_groups:
-                try:
-                    pure_gid = gid.split(':')[-1] if ':' in gid else gid
-                    for platform in platforms:
-                        if hasattr(platform, 'get_client'):
-                            client = platform.get_client()
-                            if client and hasattr(client, 'set_group_ban'):
-                                try:
-                                    await client.set_group_ban(
-                                        group_id=int(pure_gid),
-                                        user_id=int(target_qq),
-                                        duration=0
-                                    )
-                                    success_count += 1
-                                    break
-                                except Exception as e:
-                                    logger.debug(f"平台处理群 {gid} 解除禁言失败: {e}")
-                                    continue
-                except Exception as e:
-                    logger.error(f"解除禁言失败 (群{gid}): {e}")
+            for platform in platforms:
+                if hasattr(platform, 'get_client'):
+                    client = platform.get_client()
+                    if client and hasattr(client, 'set_group_ban'):
+                        try:
+                            await client.set_group_ban(
+                                group_id=int(pure_gid),
+                                user_id=int(target_qq),
+                                duration=0
+                            )
+                            break
+                        except Exception as e:
+                            logger.debug(f"解除禁言失败: {e}")
+                            continue
+                    elif client and hasattr(client, 'call_api'):
+                        try:
+                            await client.call_api(
+                                'set_group_ban',
+                                group_id=int(pure_gid),
+                                user_id=int(target_qq),
+                                duration=0
+                            )
+                            break
+                        except Exception as e:
+                            logger.debug(f"解除禁言失败: {e}")
+                            continue
+            else:
+                yield event.plain_result(f"❌ 撤销失败：解除禁言操作未成功")
+                return
 
         elif action_type == "kick":
-            # 从黑名单移除
-            blacklist = await self.get_kv_data("blacklist", [])
-            blacklist = [
-                entry for entry in blacklist
-                if entry.get("qq") != target_qq
-            ]
-            await self.put_kv_data("blacklist", blacklist)
-            success_count = 1
+            async with self._blacklist_lock:
+                blacklist = self._get_blacklist()
+                blacklist = [
+                    entry for entry in blacklist
+                    if entry.get("qq") != target_qq
+                ]
+                self._save_blacklist(blacklist)
+
+        # 更新数据库状态
+        conn = sqlite3.connect(str(self.db_path))
+        cursor = conn.cursor()
+        cursor.execute('UPDATE records SET status = ? WHERE id = ?', ('revoked', record_id))
+        conn.commit()
+        conn.close()
 
         # 播报
         broadcast_msg = f"【撤销通知】\n记录ID: {record_id}\n类型: {action_type}\n目标: {target_qq}\n原处罚原因: {original_reason}\n撤销原因: {undo_reason}\n操作者: {operator_qq}"
@@ -636,20 +663,34 @@ class GroupManagerPlugin(Star):
 
         net_name = parts[1]
         group_id = str(event.unified_msg_origin)
+        pure_gid = self._pure_gid(group_id)
+        added = False
+        already = False
 
-        groups = await self.get_kv_data("groups", {})
+        async with self._groups_lock:
+            groups = self._get_groups()
 
-        if net_name not in groups:
-            groups[net_name] = {
-                "播报群": "",
-                "执行群列表": []
-            }
+            target = None
+            for g in groups:
+                if g.get("name") == net_name:
+                    target = g
+                    break
+            if target is None:
+                target = {"name": net_name, "log_group": "", "exec_groups": []}
+                groups.append(target)
 
-        if group_id not in groups[net_name]["执行群列表"]:
-            groups[net_name]["执行群列表"].append(group_id)
-            await self.put_kv_data("groups", groups)
+            exec_list = target.get("exec_groups", [])
+            if any(self._pure_gid(str(g)) == pure_gid for g in exec_list):
+                already = True
+            else:
+                exec_list.append(group_id)
+                target["exec_groups"] = exec_list
+                self._save_groups(groups)
+                added = True
+
+        if added:
             yield event.plain_result(f"✅ 当前群已加入联动组: {net_name}")
-        else:
+        elif already:
             yield event.plain_result(f"ℹ️ 当前群已在联动组: {net_name}")
 
     @filter.command("g_leave")
@@ -661,18 +702,26 @@ class GroupManagerPlugin(Star):
             return
 
         group_id = str(event.unified_msg_origin)
-        groups = await self.get_kv_data("groups", {})
-        found = False
+        pure_gid = self._pure_gid(group_id)
+        found_name = None
 
-        for net_name, net_config in groups.items():
-            if group_id in net_config.get("执行群列表", []):
-                net_config["执行群列表"].remove(group_id)
-                await self.put_kv_data("groups", groups)
-                found = True
-                yield event.plain_result(f"✅ 当前群已离开联动组: {net_name}")
-                break
+        async with self._groups_lock:
+            groups = self._get_groups()
+            for g in groups:
+                exec_list = g.get("exec_groups", [])
+                for existing in list(exec_list):
+                    if self._pure_gid(str(existing)) == pure_gid:
+                        exec_list.remove(existing)
+                        g["exec_groups"] = exec_list
+                        self._save_groups(groups)
+                        found_name = g.get("name", "")
+                        break
+                if found_name is not None:
+                    break
 
-        if not found:
+        if found_name is not None:
+            yield event.plain_result(f"✅ 当前群已离开联动组: {found_name}")
+        else:
             yield event.plain_result("ℹ️ 当前群未加入任何联动组")
 
     @filter.command("g_log")
@@ -691,17 +740,55 @@ class GroupManagerPlugin(Star):
         net_name = parts[1]
         group_id = str(event.unified_msg_origin)
 
-        groups = await self.get_kv_data("groups", {})
+        async with self._groups_lock:
+            groups = self._get_groups()
+            target = None
+            for g in groups:
+                if g.get("name") == net_name:
+                    target = g
+                    break
+            if target is None:
+                target = {"name": net_name, "log_group": "", "exec_groups": []}
+                groups.append(target)
+            target["log_group"] = group_id
+            self._save_groups(groups)
 
-        if net_name not in groups:
-            groups[net_name] = {
-                "播报群": "",
-                "执行群列表": []
-            }
-
-        groups[net_name]["播报群"] = group_id
-        await self.put_kv_data("groups", groups)
         yield event.plain_result(f"✅ 当前群已设为联动组 [{net_name}] 的播报群")
+
+    @filter.command("g_list")
+    async def cmd_g_list(self, event: AstrMessageEvent):
+        """查看联动组配置: /g_list [组名]"""
+        sender_qq = str(event.message_obj.sender.user_id)
+        if not self.is_super_admin(sender_qq):
+            yield event.plain_result("❌ 权限不足，仅超管可用")
+            return
+
+        parts = event.message_str.strip().split(maxsplit=1)
+        filter_name = parts[1] if len(parts) >= 2 else None
+
+        async with self._groups_lock:
+            groups = self._get_groups()
+
+        if not groups:
+            yield event.plain_result("📋 暂无联动组配置")
+            return
+
+        result = "📋 联动组配置\n\n"
+        for g in groups:
+            name = g.get("name", "")
+            if filter_name and name != filter_name:
+                continue
+            log_group = g.get("log_group", "")
+            log_pure = self._pure_gid(log_group) if log_group else ""
+            exec_list = g.get("exec_groups", [])
+            result += f"【{name}】\n"
+            result += f"  播报群: {log_pure or '未设置'}\n"
+            result += f"  执行群 ({len(exec_list)}个):\n"
+            for gid in exec_list:
+                result += f"    - {self._pure_gid(str(gid))}\n"
+            result += "\n"
+
+        yield event.plain_result(result.strip())
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def handle_event(self, event: AstrMessageEvent):
@@ -755,7 +842,7 @@ class GroupManagerPlugin(Star):
         """
         try:
             # 检查黑名单
-            blacklist = await self.get_kv_data("blacklist", [])
+            blacklist = self._get_blacklist()
 
             blacklist_entry = None
             for entry in blacklist:
@@ -838,7 +925,7 @@ class GroupManagerPlugin(Star):
         if len(parts) >= 2 and parts[1].isdigit():
             page = int(parts[1])
 
-        blacklist = await self.get_kv_data("blacklist", [])
+        blacklist = self._get_blacklist()
 
         if not blacklist:
             yield event.plain_result("📋 黑名单为空")
@@ -884,16 +971,17 @@ class GroupManagerPlugin(Star):
             yield event.plain_result("❌ QQ号必须为数字")
             return
 
-        blacklist = await self.get_kv_data("blacklist", [])
-        original_count = len(blacklist)
+        async with self._blacklist_lock:
+            blacklist = self._get_blacklist()
+            original_count = len(blacklist)
+            blacklist = [entry for entry in blacklist if entry.get("qq") != target_qq]
+            item_removed = len(blacklist) < original_count
+            if item_removed:
+                self._save_blacklist(blacklist)
 
-        blacklist = [entry for entry in blacklist if entry.get("qq") != target_qq]
-
-        if len(blacklist) == original_count:
+        if not item_removed:
             yield event.plain_result(f"❌ QQ {target_qq} 不在黑名单中")
             return
-
-        await self.put_kv_data("blacklist", blacklist)
 
         operator_qq = str(event.message_obj.sender.user_id)
         group_id = str(event.unified_msg_origin)
@@ -911,6 +999,133 @@ class GroupManagerPlugin(Star):
             await self.broadcast_to_log_group(net_name, broadcast_msg)
 
         yield event.plain_result(f"✅ 已将 QQ {target_qq} 从黑名单移除")
+
+    @filter.command("gminfo")
+    async def cmd_gminfo(self, event: AstrMessageEvent):
+        """全局违规记录汇总: /gminfo"""
+        if not self.check_permission(event):
+            yield event.plain_result("❌ 权限不足，操作取消")
+            return
+
+        conn = sqlite3.connect(str(self.db_path))
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT COUNT(*) FROM records")
+        total_count = cursor.fetchone()[0]
+
+        if total_count == 0:
+            conn.close()
+            yield event.plain_result("📋 暂无违规记录")
+            return
+
+        cursor.execute("SELECT COUNT(*) FROM records WHERE status = 'active'")
+        active_count = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM records WHERE status = 'revoked'")
+        revoked_count = cursor.fetchone()[0]
+
+        cursor.execute('''
+            SELECT action_type, COUNT(*), SUM(duration)
+            FROM records
+            GROUP BY action_type
+        ''')
+        type_summary = cursor.fetchall()
+
+        cursor.execute('''
+            SELECT id, action_type, target_qq, operator_qq, reason, duration, timestamp, status
+            FROM records
+            ORDER BY timestamp DESC
+        ''')
+        all_records = cursor.fetchall()
+        conn.close()
+
+        action_map = {"mute": "禁言", "kick": "踢出", "warn": "警告"}
+        status_map = {"active": "生效中", "revoked": "已撤销"}
+
+        type_rows = ""
+        for action_type, count, total_duration in type_summary:
+            label = action_map.get(action_type, action_type)
+            dur_text = f"，累计{total_duration or 0}分钟" if action_type == "mute" else ""
+            type_rows += f'<tr><td>{label}</td><td>{count} 次{dur_text}</td></tr>'
+
+        record_rows = ""
+        for record_id, action_type, target_qq, operator_qq, reason, duration, timestamp, status in all_records:
+            status_style = 'color:#e74c3c;font-weight:bold' if status == 'revoked' else 'color:#27ae60'
+            label = action_map.get(action_type, action_type)
+            dur_text = f" {duration}分钟" if duration else ""
+            reason_text = reason or "-"
+            record_rows += (
+                f'<tr>'
+                f'<td>{record_id}</td>'
+                f'<td>{label}{dur_text}</td>'
+                f'<td>{target_qq}</td>'
+                f'<td>{operator_qq}</td>'
+                f'<td>{reason_text}</td>'
+                f'<td>{timestamp}</td>'
+                f'<td style="{status_style}">{status_map.get(status, status)}</td>'
+                f'</tr>'
+            )
+
+        html = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:"Microsoft YaHei","PingFang SC",sans-serif;background:#f0f2f5;padding:30px;color:#333}
+.container{max-width:1100px;margin:0 auto}
+.header{background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;padding:30px 40px;border-radius:12px 12px 0 0}
+.header h1{font-size:26px;margin-bottom:8px}
+.header p{font-size:14px;opacity:.85}
+.stats{display:flex;gap:16px;padding:24px 40px;background:#fff;border-bottom:1px solid #e8e8e8}
+.stat-card{flex:1;text-align:center;padding:16px;background:#f7f8fc;border-radius:8px}
+.stat-card .num{font-size:28px;font-weight:700;color:#667eea}
+.stat-card .label{font-size:13px;color:#888;margin-top:4px}
+.stat-card.active .num{color:#27ae60}
+.stat-card.revoked .num{color:#e74c3c}
+.type-table-wrap{padding:0 40px 24px;background:#fff}
+.type-table-wrap h3{font-size:16px;padding:16px 0 8px;color:#555}
+.type-table{width:100%;border-collapse:collapse}
+.type-table td{padding:8px 12px;border-bottom:1px solid #f0f0f0;font-size:14px}
+.type-table td:first-child{font-weight:600;width:80px}
+.record-table-wrap{padding:0 40px 30px;background:#fff;border-radius:0 0 12px 12px}
+.record-table-wrap h3{font-size:16px;padding:0 0 12px;color:#555}
+.record-table{width:100%;border-collapse:collapse;font-size:13px}
+.record-table th{background:#f7f8fc;padding:10px 8px;text-align:left;border-bottom:2px solid #e8e8e8;font-weight:600;white-space:nowrap}
+.record-table td{padding:8px;border-bottom:1px solid #f0f0f0;word-break:break-all}
+.record-table tr:hover{background:#fafbff}
+.footer{text-align:center;padding:20px;color:#aaa;font-size:12px}
+</style>
+</head>
+<body>
+<div class="container">
+<div class="header"><h1>📋 违规管理记录汇总</h1><p>生成时间：{{ gen_time }}</p></div>
+<div class="stats">
+<div class="stat-card"><div class="num">{{ total }}</div><div class="label">总记录数</div></div>
+<div class="stat-card active"><div class="num">{{ active }}</div><div class="label">生效中</div></div>
+<div class="stat-card revoked"><div class="num">{{ revoked }}</div><div class="label">已撤销</div></div>
+</div>
+<div class="type-table-wrap"><h3>分类统计</h3>
+<table class="type-table">{{ type_rows }}</table></div>
+<div class="record-table-wrap"><h3>全部记录</h3>
+<table class="record-table">
+<thead><tr><th>ID</th><th>类型</th><th>目标QQ</th><th>操作者</th><th>原因</th><th>时间</th><th>状态</th></tr></thead>
+<tbody>{{ record_rows }}</tbody></table></div>
+<div class="footer">QManagementMaster - 多群联动违规管理系统</div>
+</div>
+</body>
+</html>"""
+
+        url = await self.html_render(html, {
+            "gen_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "total": str(total_count),
+            "active": str(active_count),
+            "revoked": str(revoked_count),
+            "type_rows": type_rows,
+            "record_rows": record_rows,
+        }, return_url=True)
+
+        yield event.image_result(url)
 
     async def terminate(self):
         """插件卸载时的清理"""
