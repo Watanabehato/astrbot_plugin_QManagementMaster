@@ -34,26 +34,31 @@ git clone https://github.com/Watanabehato/astrbot_plugin_QManagementMaster.git
 - 输入超管的 QQ 号
 - 点击"保存配置"
 
-### 2. 配置群网络拓扑（可选）
+### 2. 配置群网络拓扑
 
-你可以在 WebUI 中预先配置群网络，或者通过指令动态配置：
+你可以在 WebUI 中直接配置群网络，或者通过指令动态配置：
 
 **WebUI 配置方式**：
-- 在 `groups` 字典中添加新键（联动组名）
-- 设置"播报群"和"执行群列表"
+- 在 `groups` 列表中添加联动组
+- 设置每个联动组的"联动组名称"、"播报群群号"和"执行群列表"
+- 保存配置后重载插件生效
 
-**指令配置方式**（推荐）：
+**指令配置方式**（推荐，实时生效）：
 - `/g_join <组名>`：将当前群加入联动组的执行群列表
 - `/g_log <组名>`：将当前群设为该组的播报群
+- `/g_list [组名]`：查看联动组配置
 
 ## 📖 指令列表
 
 ### 处罚类指令 (超管/群管可用)
 
-#### `/mute <目标> <分钟数> <原因>`
-禁言用户，在所有执行群中生效
+#### `/mute <目标> <时长> <原因>`
+禁言用户，在所有执行群中生效。时长支持自定义格式。
 ```
-/mute @张三 60 发广告
+/mute @张三 60 发广告          # 纯数字 = 分钟
+/mute @张三 30m 刷屏           # 30分钟
+/mute @张三 2h 恶意发言        # 2小时
+/mute @张三 1d 严重违规        # 1天
 /mute 123456789 30 刷屏
 ```
 
@@ -77,6 +82,12 @@ git clone https://github.com/Watanabehato/astrbot_plugin_QManagementMaster.git
 ```
 /record @张三
 /record 123456789
+```
+
+#### `/gminfo`
+生成全局违规记录汇总报表，以图片形式返回
+```
+/gminfo
 ```
 
 #### `/undo <记录ID> <原因>`
@@ -107,6 +118,13 @@ git clone https://github.com/Watanabehato/astrbot_plugin_QManagementMaster.git
 /g_log 主群网络
 ```
 
+#### `/g_list [组名]`
+查看联动组配置（可选指定组名筛选）
+```
+/g_list
+/g_list 主群网络
+```
+
 ## 🔧 权限说明
 
 ### 超管 (Super Admin)
@@ -120,16 +138,17 @@ git clone https://github.com/Watanabehato/astrbot_plugin_QManagementMaster.git
 
 ## 🗂️ 数据结构
 
-### 配置文件 (`group_manager_config.json`)
+### 配置文件 (`data/config/astrbot_plugin_QManagementMaster.json`)
 ```json
 {
   "super_admins": ["QQ号1", "QQ号2"],
-  "groups": {
-    "联动组名": {
-      "播报群": "群号",
-      "执行群列表": ["群号1", "群号2"]
+  "groups": [
+    {
+      "name": "联动组名",
+      "log_group": "播报群群号",
+      "exec_groups": ["群号1", "群号2"]
     }
-  },
+  ],
   "blacklist": [
     {
       "qq": "QQ号",
@@ -196,6 +215,18 @@ git clone https://github.com/Watanabehato/astrbot_plugin_QManagementMaster.git
    - 黑名单用户尝试加群时会被自动踢出（需要机器人有管理员权限）
 
 ## 🔄 版本历史
+
+### v1.2.1 (2026-06-18)
+- ✨ 新增 `/gminfo` 指令 — 全局违规记录汇总，HTML 渲染后通过 T2I 输出为图片
+- ✨ `/mute` 支持自定义时长后缀 `1m` / `2h` / `1d`，兼容纯数字分钟
+- 🐛 修复 `/mute` `/kick` `/warn` `/undo` 操作失败时数据库已写入但返回假成功的问题
+
+### v1.2.0 (2026-06-17)
+- ✨ 联动组配置支持在 WebUI 管理面板直接编辑（`_conf_schema.json` 新增 `groups` 字段）
+- 🔄 自动迁移旧的 KV 存储数据到插件配置（list 格式）
+- 🐛 修复并发 `/g_join` 导致群丢失的竞态条件（加 asyncio.Lock）
+- ✨ 新增 `/g_list` 指令查看联动组配置
+- 🔧 群号匹配统一使用纯群号比对，避免格式不一致问题
 
 ### v1.1.1 (2026-06-17)
 - 🐛 修复 Release CI 的 403 权限错误（补 `contents: write`）
