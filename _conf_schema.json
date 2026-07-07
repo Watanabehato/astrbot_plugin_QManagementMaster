@@ -9,30 +9,12 @@
     }
   },
   "groups": {
-    "type": "list",
+    "type": "text",
     "description": "QQ群联动组配置",
-    "hint": "每个联动组包含一个播报群和多个执行群。群号可填写纯群号，也可填写完整 UMO，例如 aiocqhttp:GroupMessage:123456789。",
-    "default": [],
-    "items": {
-      "type": "object",
-      "items": {
-        "name": {
-          "type": "string",
-          "description": "联动组名称"
-        },
-        "log_group": {
-          "type": "string",
-          "description": "播报群群号或 UMO"
-        },
-        "exec_groups": {
-          "type": "list",
-          "description": "执行群列表",
-          "items": {
-            "type": "string"
-          }
-        }
-      }
-    }
+    "hint": "填写 JSON 对象。键是联动组名称，值包含 log_group 和 exec_groups。群号可填写纯群号，也可填写完整 UMO，例如 aiocqhttp:GroupMessage:123456789。",
+    "default": "{\n  \"主群网络\": {\n    \"log_group\": \"123456789\",\n    \"exec_groups\": [\n      \"123456789\",\n      \"987654321\"\n    ]\n  }\n}",
+    "editor_mode": true,
+    "editor_language": "json"
   },
   "blacklist": {
     "type": "list",

@@ -12,7 +12,7 @@ from astrbot.api.message_components import Plain, At
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 
-@register("QManagementMaster", "Watanabehato", "QQ多群联动违规管理插件", "1.2.2")
+@register("QManagementMaster", "Watanabehato", "QQ多群联动违规管理插件", "1.2.3")
 class GroupManagerPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -33,20 +33,23 @@ class GroupManagerPlugin(Star):
         # 迁移旧的 KV groups 数据到插件配置
         old_groups = await self.get_kv_data("groups", {})
         if old_groups and isinstance(old_groups, dict) and len(old_groups) > 0:
-            new_groups = []
+            new_groups = {}
             for name, cfg in old_groups.items():
                 if not isinstance(cfg, dict):
                     continue
-                new_groups.append({
-                    "name": name,
+                new_groups[str(name)] = {
                     "log_group": cfg.get("播报群", ""),
                     "exec_groups": cfg.get("执行群列表", [])
-                })
+                }
             if new_groups:
-                self.config["groups"] = new_groups
+                self.config["groups"] = self._groups_config_text_from_mapping(new_groups)
                 self.config.save_config()
                 await self.put_kv_data("groups", {})
                 logger.info(f"已迁移 {len(new_groups)} 个联动组到插件配置")
+
+        # 将 v1.2.2 的 list 配置或手写 dict 配置转换为后台 JSON 文本编辑器格式
+        if self._normalize_groups_config():
+            self.config.save_config()
 
         # 迁移旧的 KV blacklist 数据到插件配置
         old_blacklist = await self.get_kv_data("blacklist", [])
@@ -69,14 +72,104 @@ class GroupManagerPlugin(Star):
         logger.info("GroupManager 插件初始化完成")
 
     def _get_groups(self) -> list:
-        groups = self.config.get("groups", [])
-        if not isinstance(groups, list):
-            return []
-        return groups
+        raw_groups = self.config.get("groups", "{}")
+        return self._groups_from_config(raw_groups)
 
     def _save_groups(self, groups: list):
-        self.config["groups"] = groups
+        self.config["groups"] = self._groups_config_text_from_list(groups)
         self.config.save_config()
+
+    def _normalize_groups_config(self) -> bool:
+        raw_groups = self.config.get("groups", "{}")
+        if isinstance(raw_groups, str):
+            return False
+        if isinstance(raw_groups, list):
+            self.config["groups"] = self._groups_config_text_from_list(raw_groups)
+            return True
+        if isinstance(raw_groups, dict):
+            self.config["groups"] = self._groups_config_text_from_mapping(raw_groups)
+            return True
+        return False
+
+    def _groups_from_config(self, raw_groups: Any) -> list:
+        if isinstance(raw_groups, list):
+            return self._groups_from_list(raw_groups)
+        if isinstance(raw_groups, dict):
+            return self._groups_from_mapping(raw_groups)
+        if isinstance(raw_groups, str):
+            text = raw_groups.strip()
+            if not text:
+                return []
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError as exc:
+                logger.error(f"groups 不是合法 JSON: {exc}")
+                return []
+            if isinstance(parsed, dict):
+                return self._groups_from_mapping(parsed)
+            if isinstance(parsed, list):
+                return self._groups_from_list(parsed)
+            logger.error("groups JSON 必须是对象，例如 {\"主群网络\": {\"log_group\": \"123\", \"exec_groups\": [\"123\"]}}")
+            return []
+        return []
+
+    def _groups_from_mapping(self, groups: dict) -> list:
+        normalized = []
+        for name, cfg in groups.items():
+            if not isinstance(cfg, dict):
+                logger.warning(f"忽略非法联动组配置: {name}")
+                continue
+            normalized.append(self._normalize_group_config(str(name), cfg))
+        return normalized
+
+    def _groups_from_list(self, groups: list) -> list:
+        normalized = []
+        for item in groups:
+            if not isinstance(item, dict):
+                logger.warning(f"忽略非法联动组配置: {item}")
+                continue
+            name = str(item.get("name", "")).strip()
+            if not name:
+                logger.warning(f"忽略缺少 name 的联动组配置: {item}")
+                continue
+            normalized.append(self._normalize_group_config(name, item))
+        return normalized
+
+    def _normalize_group_config(self, name: str, cfg: dict) -> dict:
+        exec_groups = cfg.get("exec_groups", cfg.get("执行群列表", []))
+        if isinstance(exec_groups, str):
+            exec_groups = [line.strip() for line in exec_groups.splitlines() if line.strip()]
+        if not isinstance(exec_groups, list):
+            exec_groups = []
+        return {
+            "name": name,
+            "log_group": str(cfg.get("log_group", cfg.get("播报群", ""))).strip(),
+            "exec_groups": [str(group).strip() for group in exec_groups if str(group).strip()],
+        }
+
+    def _groups_config_text_from_list(self, groups: list) -> str:
+        mapping = {}
+        for group in self._groups_from_list(groups):
+            name = group.get("name", "")
+            if not name:
+                continue
+            mapping[name] = {
+                "log_group": group.get("log_group", ""),
+                "exec_groups": group.get("exec_groups", []),
+            }
+        return self._groups_config_text_from_mapping(mapping)
+
+    def _groups_config_text_from_mapping(self, groups: dict) -> str:
+        mapping = {}
+        for group in self._groups_from_mapping(groups):
+            name = group.get("name", "")
+            if not name:
+                continue
+            mapping[name] = {
+                "log_group": group.get("log_group", ""),
+                "exec_groups": group.get("exec_groups", []),
+            }
+        return json.dumps(mapping, ensure_ascii=False, indent=2)
 
     def _get_blacklist(self) -> list:
         blacklist = self.config.get("blacklist", [])

@@ -39,8 +39,8 @@ git clone https://github.com/Watanabehato/astrbot_plugin_QManagementMaster.git
 你可以在 WebUI 中直接配置群网络，或者通过指令动态配置：
 
 **WebUI 配置方式**：
-- 在 `groups` 列表中添加联动组
-- 设置每个联动组的"联动组名称"、"播报群群号"和"执行群列表"
+- 在 `groups` JSON 编辑器中填写联动组对象
+- 对象的键是联动组名称，值里设置 `log_group` 播报群和 `exec_groups` 执行群列表
 - 保存配置后重载插件生效
 
 **指令配置方式**（推荐，实时生效）：
@@ -142,13 +142,12 @@ git clone https://github.com/Watanabehato/astrbot_plugin_QManagementMaster.git
 ```json
 {
   "super_admins": ["QQ号1", "QQ号2"],
-  "groups": [
-    {
-      "name": "联动组名",
+  "groups": {
+    "联动组名": {
       "log_group": "播报群群号",
       "exec_groups": ["群号1", "群号2"]
     }
-  ],
+  },
   "blacklist": [
     {
       "qq": "QQ号",
@@ -215,6 +214,10 @@ git clone https://github.com/Watanabehato/astrbot_plugin_QManagementMaster.git
    - 黑名单用户尝试加群时会被自动踢出（需要机器人有管理员权限）
 
 ## 🔄 版本历史
+
+### v1.2.3 (2026-07-07)
+- 🔧 `groups` 改为 JSON 对象文本编辑器，参照 `target_aliases` 的配置体验，方便在 AstrBot WebUI 中直接编辑复杂群组映射
+- 🔄 兼容读取 v1.2.2 的 list 格式、旧 KV 字典格式和新的 JSON 对象格式
 
 ### v1.2.2 (2026-07-07)
 - 🐛 修复 AstrBot WebUI 无法编辑 QQ 群联动组配置的问题（`_conf_schema.json` 新增 `groups` 字段）
