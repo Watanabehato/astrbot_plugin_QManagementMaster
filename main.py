@@ -3,7 +3,7 @@ import sqlite3
 import asyncio
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Any
 
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star, register
@@ -12,7 +12,7 @@ from astrbot.api.message_components import Plain, At
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 
-@register("QManagementMaster", "Watanabehato", "QQ多群联动违规管理插件", "1.2.1")
+@register("QManagementMaster", "Watanabehato", "QQ多群联动违规管理插件", "1.2.2")
 class GroupManagerPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -175,6 +175,138 @@ class GroupManagerPlugin(Star):
                     return g.get("name", ""), g
         return None
 
+    def _exec_group_ids(self, net_config: dict) -> List[str]:
+        """返回联动组内去重后的纯群号列表。"""
+        raw_groups = net_config.get("exec_groups", [])
+        if not isinstance(raw_groups, list):
+            return []
+
+        result: List[str] = []
+        seen = set()
+        for item in raw_groups:
+            pure_gid = self._pure_gid(str(item).strip())
+            if not pure_gid or not pure_gid.isdigit():
+                logger.warning(f"忽略非法执行群配置: {item}")
+                continue
+            if pure_gid in seen:
+                continue
+            result.append(pure_gid)
+            seen.add(pure_gid)
+        return result
+
+    async def _call_onebot_action(
+        self,
+        event: Optional[AstrMessageEvent],
+        action: str,
+        **payload: Any,
+    ) -> Any:
+        """按 OneBot/SnowLuma action 名调用 API，优先使用当前事件的 bot.api。"""
+        try:
+            bot = getattr(event, "bot", None) if event is not None else None
+            api = getattr(bot, "api", None) if bot is not None else None
+            if api is not None and hasattr(api, "call_action"):
+                logger.info(f"调用 OneBot API: {action} {payload}")
+                return await api.call_action(action, **payload)
+
+            return await self._call_onebot_direct(action, **payload)
+        except Exception as exc:
+            if self._should_ignore_send_timeout(action, exc):
+                logger.warning(f"忽略 OneBot 发送超时: action={action}, payload={payload}, error={exc}")
+                return {"status": "ok", "retcode": 0, "message": "ignored send timeout"}
+            raise
+
+    async def _call_onebot_direct(self, action: str, **payload: Any) -> Any:
+        """没有事件对象时，通过平台适配器客户端调用 OneBot action。"""
+        last_error = ""
+        for platform in self.context.platform_manager.get_insts():
+            if not hasattr(platform, "get_client"):
+                continue
+
+            client = platform.get_client()
+            if client is None:
+                continue
+
+            method = getattr(client, action, None)
+            if callable(method):
+                try:
+                    logger.info(f"通过客户端方法调用 OneBot API: {action} {payload}")
+                    return await method(**payload)
+                except Exception as exc:
+                    last_error = str(exc)
+                    logger.debug(f"客户端方法调用失败: {action}, error={exc}")
+                    continue
+
+            call_api = getattr(client, "call_api", None)
+            if callable(call_api):
+                try:
+                    logger.info(f"通过 call_api 调用 OneBot API: {action} {payload}")
+                    return await call_api(action, **payload)
+                except Exception as exc:
+                    last_error = str(exc)
+                    logger.debug(f"call_api 调用失败: {action}, error={exc}")
+                    continue
+
+            api = getattr(client, "api", None)
+            call_action = getattr(api, "call_action", None) if api is not None else None
+            if callable(call_action):
+                try:
+                    logger.info(f"通过 client.api 调用 OneBot API: {action} {payload}")
+                    return await call_action(action, **payload)
+                except Exception as exc:
+                    last_error = str(exc)
+                    logger.debug(f"client.api 调用失败: {action}, error={exc}")
+                    continue
+
+        raise RuntimeError(last_error or f"未找到可用 OneBot API 客户端: {action}")
+
+    async def _call_group_action(
+        self,
+        event: Optional[AstrMessageEvent],
+        action: str,
+        group_id: str,
+        **payload: Any,
+    ) -> Any:
+        pure_gid = self._pure_gid(str(group_id))
+        if not pure_gid.isdigit():
+            raise ValueError(f"群号格式不正确: {group_id}")
+        return await self._call_onebot_action(event, action, group_id=int(pure_gid), **payload)
+
+    async def _run_group_action(
+        self,
+        event: Optional[AstrMessageEvent],
+        action: str,
+        group_ids: List[str],
+        **payload: Any,
+    ) -> tuple:
+        success: List[str] = []
+        failed: Dict[str, str] = {}
+        for group_id in group_ids:
+            try:
+                await self._call_group_action(event, action, group_id, **payload)
+                success.append(group_id)
+            except Exception as exc:
+                failed[group_id] = str(exc)
+                logger.warning(f"群 {group_id} 执行 {action} 失败: {exc}")
+        return success, failed
+
+    def _format_group_result(self, success: List[str], failed: Dict[str, str]) -> str:
+        lines = []
+        if success:
+            lines.append(f"成功群: {', '.join(success)}")
+        if failed:
+            lines.append("失败群: " + ", ".join(f"{gid}({reason})" for gid, reason in failed.items()))
+        return "\n".join(lines)
+
+    def _should_ignore_send_timeout(self, action: str, exc: Exception) -> bool:
+        if not self.config.get("ignore_send_timeout_1200", True):
+            return False
+        if action not in {"send_group_msg", "send_msg", "_send_group_notice"}:
+            return False
+        if getattr(exc, "retcode", None) != 1200:
+            return False
+        message = str(exc)
+        return "Timeout" in message and "sendMsg" in message
+
     def add_record(self, action_type: str, target_qq: str, operator_qq: str,
                    reason: str, duration: int = None) -> int:
         """添加处罚记录到数据库，返回记录ID"""
@@ -208,21 +340,8 @@ class GroupManagerPlugin(Star):
             return
 
         try:
-            # 使用平台适配器直接发送消息
-            platforms = self.context.platform_manager.get_insts()
-            for platform in platforms:
-                if hasattr(platform, 'get_client'):
-                    client = platform.get_client()
-                    if client and hasattr(client, 'send_group_msg'):
-                        try:
-                            # 提取纯群号
-                            pure_gid = log_group.split(':')[-1] if ':' in log_group else log_group
-                            await client.send_group_msg(group_id=int(pure_gid), message=message)
-                            logger.info(f"播报消息发送成功到群 {log_group}")
-                            break
-                        except Exception as e:
-                            logger.debug(f"平台发送播报失败: {e}")
-                            continue
+            await self._call_group_action(None, "send_group_msg", log_group, message=message)
+            logger.info(f"播报消息发送成功到群 {log_group}")
         except Exception as e:
             logger.error(f"播报消息失败: {e}", exc_info=True)
 
@@ -265,42 +384,20 @@ class GroupManagerPlugin(Star):
             return
 
         net_name, net_config = network_info
-        exec_groups = net_config.get("exec_groups", [])
+        exec_groups = self._exec_group_ids(net_config)
+        if not exec_groups:
+            yield event.plain_result("❌ 当前联动组未配置执行群")
+            return
 
-        # 在当前群执行禁言
-        pure_gid = group_id.split(':')[-1] if ':' in group_id else group_id
-        last_error = ""
-        platforms = self.context.platform_manager.get_insts()
-        for platform in platforms:
-            if hasattr(platform, 'get_client'):
-                client = platform.get_client()
-                if client and hasattr(client, 'set_group_ban'):
-                    try:
-                        await client.set_group_ban(
-                            group_id=int(pure_gid),
-                            user_id=int(target_qq),
-                            duration=duration * 60
-                        )
-                        break
-                    except Exception as e:
-                        last_error = str(e)
-                        logger.warning(f"禁言失败: {e}")
-                        continue
-                elif client and hasattr(client, 'call_api'):
-                    try:
-                        await client.call_api(
-                            'set_group_ban',
-                            group_id=int(pure_gid),
-                            user_id=int(target_qq),
-                            duration=duration * 60
-                        )
-                        break
-                    except Exception as e:
-                        last_error = str(e)
-                        logger.warning(f"禁言失败: {e}")
-                        continue
-        else:
-            yield event.plain_result(f"❌ 禁言失败\n{last_error}")
+        success_groups, failed_groups = await self._run_group_action(
+            event,
+            "set_group_ban",
+            exec_groups,
+            user_id=int(target_qq),
+            duration=duration * 60,
+        )
+        if not success_groups:
+            yield event.plain_result(f"❌ 禁言失败\n{self._format_group_result(success_groups, failed_groups)}")
             return
 
         # 记录到数据库
@@ -313,10 +410,15 @@ class GroupManagerPlugin(Star):
             time_str = f"{duration // 60}小时"
         else:
             time_str = f"{duration}分钟"
-        broadcast_msg = f"【禁言通知】\n记录ID: {record_id}\n目标: {target_qq}\n时长: {time_str}\n原因: {reason}\n操作者: {operator_qq}\n执行群: {pure_gid}"
+        broadcast_msg = (
+            f"【禁言通知】\n记录ID: {record_id}\n目标: {target_qq}\n时长: {time_str}\n"
+            f"原因: {reason}\n操作者: {operator_qq}\n执行群: {', '.join(success_groups)}"
+        )
+        if failed_groups:
+            broadcast_msg += f"\n失败群: {', '.join(failed_groups.keys())}"
         await self.broadcast_to_log_group(net_name, broadcast_msg)
 
-        yield event.plain_result(f"✅ 禁言完成\n记录ID: {record_id}")
+        yield event.plain_result(f"✅ 禁言完成\n记录ID: {record_id}\n{self._format_group_result(success_groups, failed_groups)}")
 
     @filter.command("kick")
     async def cmd_kick(self, event: AstrMessageEvent):
@@ -346,42 +448,20 @@ class GroupManagerPlugin(Star):
             return
 
         net_name, net_config = network_info
-        exec_groups = net_config.get("exec_groups", [])
+        exec_groups = self._exec_group_ids(net_config)
+        if not exec_groups:
+            yield event.plain_result("❌ 当前联动组未配置执行群")
+            return
 
-        # 在当前群执行踢出
-        pure_gid = group_id.split(':')[-1] if ':' in group_id else group_id
-        last_error = ""
-        platforms = self.context.platform_manager.get_insts()
-        for platform in platforms:
-            if hasattr(platform, 'get_client'):
-                client = platform.get_client()
-                if client and hasattr(client, 'set_group_kick'):
-                    try:
-                        await client.set_group_kick(
-                            group_id=int(pure_gid),
-                            user_id=int(target_qq),
-                            reject_add_request=add_blacklist
-                        )
-                        break
-                    except Exception as e:
-                        last_error = str(e)
-                        logger.warning(f"踢人失败: {e}")
-                        continue
-                elif client and hasattr(client, 'call_api'):
-                    try:
-                        await client.call_api(
-                            'set_group_kick',
-                            group_id=int(pure_gid),
-                            user_id=int(target_qq),
-                            reject_add_request=add_blacklist
-                        )
-                        break
-                    except Exception as e:
-                        last_error = str(e)
-                        logger.warning(f"踢人失败: {e}")
-                        continue
-        else:
-            yield event.plain_result(f"❌ 踢出失败\n{last_error}")
+        success_groups, failed_groups = await self._run_group_action(
+            event,
+            "set_group_kick",
+            exec_groups,
+            user_id=int(target_qq),
+            reject_add_request=add_blacklist,
+        )
+        if not success_groups:
+            yield event.plain_result(f"❌ 踢出失败\n{self._format_group_result(success_groups, failed_groups)}")
             return
 
         # 添加黑名单
@@ -407,10 +487,15 @@ class GroupManagerPlugin(Star):
 
         # 播报
         blacklist_text = "✅ 已加入黑名单" if add_blacklist else ""
-        broadcast_msg = f"【踢出通知】\n记录ID: {record_id}\n目标: {target_qq}\n原因: {reason}\n操作者: {operator_qq}\n执行群: {pure_gid}\n{blacklist_text}"
+        broadcast_msg = (
+            f"【踢出通知】\n记录ID: {record_id}\n目标: {target_qq}\n原因: {reason}\n"
+            f"操作者: {operator_qq}\n执行群: {', '.join(success_groups)}\n{blacklist_text}"
+        )
+        if failed_groups:
+            broadcast_msg += f"\n失败群: {', '.join(failed_groups.keys())}"
         await self.broadcast_to_log_group(net_name, broadcast_msg)
 
-        result_text = f"✅ 踢出完成\n记录ID: {record_id}"
+        result_text = f"✅ 踢出完成\n记录ID: {record_id}\n{self._format_group_result(success_groups, failed_groups)}"
         if add_blacklist:
             result_text += "\n✅ 已加入黑名单"
         yield event.plain_result(result_text)
@@ -442,38 +527,37 @@ class GroupManagerPlugin(Star):
             return
 
         net_name, net_config = network_info
-        exec_groups = net_config.get("exec_groups", [])
+        exec_groups = self._exec_group_ids(net_config)
+        if not exec_groups:
+            yield event.plain_result("❌ 当前联动组未配置执行群")
+            return
 
-        # 在当前群发送警告
+        # 在联动组执行群发送警告
         warn_msg = f"⚠️ 警告\n用户: {target_qq}\n原因: {reason}\n操作者: {operator_qq}"
 
-        sent = False
-        pure_gid = group_id.split(':')[-1] if ':' in group_id else group_id
-        platforms = self.context.platform_manager.get_insts()
-        for platform in platforms:
-            if hasattr(platform, 'get_client'):
-                client = platform.get_client()
-                if client and hasattr(client, 'send_group_msg'):
-                    try:
-                        await client.send_group_msg(group_id=int(pure_gid), message=warn_msg)
-                        sent = True
-                        break
-                    except Exception as e:
-                        logger.debug(f"发送警告失败: {e}")
-                        continue
-
-        if not sent:
-            yield event.plain_result("❌ 发送警告失败，bot可能不在目标群或权限不足")
+        success_groups, failed_groups = await self._run_group_action(
+            event,
+            "send_group_msg",
+            exec_groups,
+            message=warn_msg,
+        )
+        if not success_groups:
+            yield event.plain_result(f"❌ 发送警告失败\n{self._format_group_result(success_groups, failed_groups)}")
             return
 
         # 记录到数据库
         record_id = self.add_record("warn", target_qq, operator_qq, reason)
 
         # 播报
-        broadcast_msg = f"【警告通知】\n记录ID: {record_id}\n目标: {target_qq}\n原因: {reason}\n操作者: {operator_qq}\n执行群: {pure_gid}"
+        broadcast_msg = (
+            f"【警告通知】\n记录ID: {record_id}\n目标: {target_qq}\n原因: {reason}\n"
+            f"操作者: {operator_qq}\n执行群: {', '.join(success_groups)}"
+        )
+        if failed_groups:
+            broadcast_msg += f"\n失败群: {', '.join(failed_groups.keys())}"
         await self.broadcast_to_log_group(net_name, broadcast_msg)
 
-        yield event.plain_result(f"✅ 警告已发送\n记录ID: {record_id}")
+        yield event.plain_result(f"✅ 警告已发送\n记录ID: {record_id}\n{self._format_group_result(success_groups, failed_groups)}")
 
     @filter.command("record")
     async def cmd_record(self, event: AstrMessageEvent):
@@ -567,7 +651,10 @@ class GroupManagerPlugin(Star):
             return
 
         net_name, net_config = network_info
-        exec_groups = net_config.get("exec_groups", [])
+        exec_groups = self._exec_group_ids(net_config)
+        if not exec_groups:
+            yield event.plain_result("❌ 当前联动组未配置执行群")
+            return
 
         # 查询记录
         conn = sqlite3.connect(str(self.db_path))
@@ -593,37 +680,18 @@ class GroupManagerPlugin(Star):
         conn.close()
 
         # 执行撤销操作
-        pure_gid = group_id.split(':')[-1] if ':' in group_id else group_id
-        platforms = self.context.platform_manager.get_insts()
+        success_groups: List[str] = []
+        failed_groups: Dict[str, str] = {}
         if action_type == "mute":
-            for platform in platforms:
-                if hasattr(platform, 'get_client'):
-                    client = platform.get_client()
-                    if client and hasattr(client, 'set_group_ban'):
-                        try:
-                            await client.set_group_ban(
-                                group_id=int(pure_gid),
-                                user_id=int(target_qq),
-                                duration=0
-                            )
-                            break
-                        except Exception as e:
-                            logger.debug(f"解除禁言失败: {e}")
-                            continue
-                    elif client and hasattr(client, 'call_api'):
-                        try:
-                            await client.call_api(
-                                'set_group_ban',
-                                group_id=int(pure_gid),
-                                user_id=int(target_qq),
-                                duration=0
-                            )
-                            break
-                        except Exception as e:
-                            logger.debug(f"解除禁言失败: {e}")
-                            continue
-            else:
-                yield event.plain_result(f"❌ 撤销失败：解除禁言操作未成功")
+            success_groups, failed_groups = await self._run_group_action(
+                event,
+                "set_group_ban",
+                exec_groups,
+                user_id=int(target_qq),
+                duration=0,
+            )
+            if not success_groups:
+                yield event.plain_result(f"❌ 撤销失败：解除禁言操作未成功\n{self._format_group_result(success_groups, failed_groups)}")
                 return
 
         elif action_type == "kick":
@@ -643,10 +711,20 @@ class GroupManagerPlugin(Star):
         conn.close()
 
         # 播报
-        broadcast_msg = f"【撤销通知】\n记录ID: {record_id}\n类型: {action_type}\n目标: {target_qq}\n原处罚原因: {original_reason}\n撤销原因: {undo_reason}\n操作者: {operator_qq}"
+        broadcast_msg = (
+            f"【撤销通知】\n记录ID: {record_id}\n类型: {action_type}\n目标: {target_qq}\n"
+            f"原处罚原因: {original_reason}\n撤销原因: {undo_reason}\n操作者: {operator_qq}"
+        )
+        if action_type == "mute":
+            broadcast_msg += f"\n解除禁言群: {', '.join(success_groups)}"
+            if failed_groups:
+                broadcast_msg += f"\n失败群: {', '.join(failed_groups.keys())}"
         await self.broadcast_to_log_group(net_name, broadcast_msg)
 
-        yield event.plain_result(f"✅ 撤销完成\n记录ID: {record_id}\n类型: {action_type}\n目标: {target_qq}")
+        result_text = f"✅ 撤销完成\n记录ID: {record_id}\n类型: {action_type}\n目标: {target_qq}"
+        if action_type == "mute":
+            result_text += f"\n{self._format_group_result(success_groups, failed_groups)}"
+        yield event.plain_result(result_text)
 
     @filter.command("g_join")
     async def cmd_g_join(self, event: AstrMessageEvent):
@@ -827,12 +905,17 @@ class GroupManagerPlugin(Star):
             logger.info(f"[黑名单拦截] 检测到群成员增加: user_id={user_id}, group_id={group_id}")
 
             # 检查黑名单
-            await self.check_and_kick_blacklist(str(user_id), str(group_id))
+            await self.check_and_kick_blacklist(str(user_id), str(group_id), event)
 
         except Exception as e:
             logger.error(f"[黑名单拦截] 处理事件失败: {e}", exc_info=True)
 
-    async def check_and_kick_blacklist(self, new_member_qq: str, group_id: str):
+    async def check_and_kick_blacklist(
+        self,
+        new_member_qq: str,
+        group_id: str,
+        event: Optional[AstrMessageEvent] = None,
+    ):
         """
         检查新成员是否在黑名单中，如果在则踢出并拉黑
 
@@ -857,25 +940,20 @@ class GroupManagerPlugin(Star):
 
             # 踢出并拉黑（无论群是否加入联动组，命中黑名单一律踢出）
             pure_gid = group_id.split(':')[-1] if ':' in group_id else group_id
-            platforms = self.context.platform_manager.get_insts()
             kicked = False
 
-            for platform in platforms:
-                if hasattr(platform, 'get_client'):
-                    client = platform.get_client()
-                    if client and hasattr(client, 'set_group_kick'):
-                        try:
-                            await client.set_group_kick(
-                                group_id=int(pure_gid),
-                                user_id=int(new_member_qq),
-                                reject_add_request=True  # 拒绝再次加群（拉黑）
-                            )
-                            kicked = True
-                            logger.info(f"成功踢出并拉黑黑名单用户 {new_member_qq} (群 {group_id})")
-                            break
-                        except Exception as e:
-                            logger.warning(f"平台踢出黑名单用户失败: {e}")
-                            continue
+            try:
+                await self._call_group_action(
+                    event,
+                    "set_group_kick",
+                    pure_gid,
+                    user_id=int(new_member_qq),
+                    reject_add_request=True,  # 拒绝再次加群（拉黑）
+                )
+                kicked = True
+                logger.info(f"成功踢出并拉黑黑名单用户 {new_member_qq} (群 {group_id})")
+            except Exception as e:
+                logger.warning(f"平台踢出黑名单用户失败: {e}")
 
             # 获取群网络信息（用于播报），找不到则跳过播报但不影响踢人
             network_info = await self.get_group_network_async(group_id)

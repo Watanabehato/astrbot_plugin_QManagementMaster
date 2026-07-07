@@ -8,6 +8,32 @@
       "type": "string"
     }
   },
+  "groups": {
+    "type": "list",
+    "description": "QQ群联动组配置",
+    "hint": "每个联动组包含一个播报群和多个执行群。群号可填写纯群号，也可填写完整 UMO，例如 aiocqhttp:GroupMessage:123456789。",
+    "default": [],
+    "items": {
+      "type": "object",
+      "items": {
+        "name": {
+          "type": "string",
+          "description": "联动组名称"
+        },
+        "log_group": {
+          "type": "string",
+          "description": "播报群群号或 UMO"
+        },
+        "exec_groups": {
+          "type": "list",
+          "description": "执行群列表",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  },
   "blacklist": {
     "type": "list",
     "description": "黑名单列表",
@@ -27,8 +53,18 @@
         "time": {
           "type": "string",
           "description": "加入黑名单时间"
+        },
+        "operator": {
+          "type": "string",
+          "description": "操作者QQ号"
         }
       }
     }
+  },
+  "ignore_send_timeout_1200": {
+    "type": "bool",
+    "description": "是否忽略 OneBot 发送消息 retcode=1200 超时",
+    "hint": "NapCat/SnowLuma 兼容端偶尔会在消息已发出后仍返回发送超时。开启后，发送群消息出现此类超时时按可能成功处理。",
+    "default": true
   }
 }

@@ -216,6 +216,11 @@ git clone https://github.com/Watanabehato/astrbot_plugin_QManagementMaster.git
 
 ## 🔄 版本历史
 
+### v1.2.2 (2026-07-07)
+- 🐛 修复 AstrBot WebUI 无法编辑 QQ 群联动组配置的问题（`_conf_schema.json` 新增 `groups` 字段）
+- 🔧 对照 OneBot v11 / SnowLuma API 重构群管理调用，统一使用 `send_group_msg`、`set_group_ban`、`set_group_kick`
+- 🐛 修复 `/mute`、`/kick`、`/warn`、`/undo` 只作用当前群的问题，改为按联动组执行群列表逐群执行并汇总失败
+
 ### v1.2.1 (2026-06-18)
 - ✨ 新增 `/gminfo` 指令 — 全局违规记录汇总，HTML 渲染后通过 T2I 输出为图片
 - ✨ `/mute` 支持自定义时长后缀 `1m` / `2h` / `1d`，兼容纯数字分钟
