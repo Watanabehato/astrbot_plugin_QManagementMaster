@@ -1,3 +1,4 @@
+import html
 import json
 import sqlite3
 import asyncio
@@ -12,7 +13,7 @@ from astrbot.api.message_components import Plain, At
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 
-@register("QManagementMaster", "Watanabehato", "QQ多群联动违规管理插件", "1.2.3")
+@register("QManagementMaster", "Watanabehato", "QQ多群联动违规管理插件", "1.2.4")
 class GroupManagerPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -218,14 +219,17 @@ class GroupManagerPlugin(Star):
 
     def is_super_admin(self, qq: str) -> bool:
         """判断是否为超管"""
-        return qq in self.config.get("super_admins", [])
+        # 归一化为 str，避免配置被手改成数字型时静默失效
+        super_admins = [str(x) for x in self.config.get("super_admins", [])]
+        return str(qq) in super_admins
 
     def is_group_admin(self, event: AstrMessageEvent) -> bool:
         """判断是否为群管理员"""
         try:
             role = event.message_obj.sender.role
             return role in ['admin', 'owner']
-        except:
+        except Exception as exc:
+            logger.debug(f"判定群管理员失败: {exc}")
             return False
 
     def check_permission(self, event: AstrMessageEvent, require_super: bool = False) -> bool:
@@ -240,20 +244,41 @@ class GroupManagerPlugin(Star):
 
         return False
 
-    def extract_target_qq(self, event: AstrMessageEvent) -> Optional[str]:
-        """从消息链中提取目标QQ号"""
-        message_chain = event.get_messages()
+    def _parse_target_and_args(self, event: AstrMessageEvent) -> tuple:
+        """解析处罚指令的目标 QQ 与剩余参数，兼容 @提及 与纯 QQ 号两种写法。
 
-        for msg in message_chain:
+        AstrBot 的 event.message_str 只含纯文本、@提及会被剥离，因此两种写法下
+        剩余参数落在不同的 token 位置：
+        - @提及：message_str 已不含目标 token，命令名之后的全部 token 都是剩余参数。
+        - 纯 QQ 号：目标占据命令名之后的第一个 token，剩余参数从其后开始。
+
+        统一在此归一，返回 (target_qq 或 None, remaining_args: List[str])，
+        remaining_args 不含命令名与目标 token。
+        """
+        tokens = event.message_str.strip().split()
+        body = tokens[1:] if tokens else []  # tokens[0] 为命令名（如 /mute）
+
+        # 优先从消息链的 At 组件取目标：
+        # - 跳过机器人自身的 @（@提及唤醒场景下 @bot 会先于目标出现，否则会误处罚机器人）
+        # - 仅接受纯数字 QQ，排除 @全体成员（At.qq == "all"）等非数字目标，避免后续 int() 崩溃
+        try:
+            self_id = str(event.get_self_id())
+        except Exception:
+            self_id = ""
+        for msg in event.get_messages():
             if isinstance(msg, At):
-                return str(msg.qq)
+                at_qq = str(msg.qq)
+                if self_id and at_qq == self_id:
+                    continue
+                if at_qq.isdecimal():
+                    return at_qq, body
 
-        # 如果没有@，尝试从文本中提取QQ号
-        parts = event.message_str.strip().split()
-        if len(parts) >= 2 and parts[1].isdigit():
-            return parts[1]
+        # 无有效 @提及：把命令名后的第一个 token 当作纯 QQ 号
+        # 用 isdecimal 而非 isdigit，确保后续 int(target_qq) 不会崩溃
+        if body and body[0].isdecimal():
+            return body[0], body[1:]
 
-        return None
+        return None, body
 
     async def get_group_network_async(self, group_id: str) -> Optional[tuple]:
         """获取群所属的网络组，返回 (组名, 组配置dict)
@@ -387,7 +412,8 @@ class GroupManagerPlugin(Star):
         if success:
             lines.append(f"成功群: {', '.join(success)}")
         if failed:
-            lines.append("失败群: " + ", ".join(f"{gid}({reason})" for gid, reason in failed.items()))
+            # 只回显失败群号，不带原始异常文本，避免泄露后端错误与兄弟群细节
+            lines.append("失败群: " + ", ".join(failed.keys()))
         return "\n".join(lines)
 
     def _should_ignore_send_timeout(self, action: str, exc: Exception) -> bool:
@@ -401,7 +427,7 @@ class GroupManagerPlugin(Star):
         return "Timeout" in message and "sendMsg" in message
 
     def add_record(self, action_type: str, target_qq: str, operator_qq: str,
-                   reason: str, duration: int = None) -> int:
+                   reason: str, duration: Optional[int] = None) -> int:
         """添加处罚记录到数据库，返回记录ID"""
         conn = sqlite3.connect(str(self.db_path))
         cursor = conn.cursor()
@@ -445,24 +471,23 @@ class GroupManagerPlugin(Star):
             yield event.plain_result("❌ 权限不足，操作取消")
             return
 
-        # 解析参数
-        parts = event.message_str.strip().split(maxsplit=3)
-        if len(parts) < 4:
-            yield event.plain_result("❌ 参数不足\n用法: /mute <目标> <时长> <原因>\n时长格式: 30m(分钟) / 2h(小时) / 1d(天) / 纯数字(分钟)")
-            return
-
-        target_qq = self.extract_target_qq(event)
+        # 解析参数（兼容 @提及 与纯 QQ 号）
+        target_qq, rest = self._parse_target_and_args(event)
         if not target_qq:
             yield event.plain_result("❌ 无法识别目标用户，请@用户或输入QQ号")
             return
 
+        if len(rest) < 2:
+            yield event.plain_result("❌ 参数不足\n用法: /mute <目标> <时长> <原因>\n时长格式: 30m(分钟) / 2h(小时) / 1d(天) / 纯数字(分钟)")
+            return
+
         try:
-            duration = self._parse_duration(parts[2])
+            duration = self._parse_duration(rest[0])
         except ValueError:
             yield event.plain_result("❌ 时长格式错误，支持: 30m(分钟) / 2h(小时) / 1d(天) / 纯数字(分钟)")
             return
 
-        reason = parts[3]
+        reason = " ".join(rest[1:])
         operator_qq = str(event.message_obj.sender.user_id)
         group_id = str(event.unified_msg_origin)
 
@@ -520,18 +545,19 @@ class GroupManagerPlugin(Star):
             yield event.plain_result("❌ 权限不足，操作取消")
             return
 
-        parts = event.message_str.strip().split(maxsplit=3)
-        if len(parts) < 3:
-            yield event.plain_result("❌ 参数不足\n用法: /kick <目标> <原因> [-b]")
-            return
-
-        target_qq = self.extract_target_qq(event)
+        target_qq, rest = self._parse_target_and_args(event)
         if not target_qq:
             yield event.plain_result("❌ 无法识别目标用户，请@用户或输入QQ号")
             return
 
-        reason = parts[2] if len(parts) >= 3 else "违规"
-        add_blacklist = "-b" in event.message_str
+        # 剔除 -b 标志后剩余的即为原因，避免 -b 被并入原因文本
+        add_blacklist = "-b" in rest
+        reason_tokens = [tok for tok in rest if tok != "-b"]
+        if not reason_tokens:
+            yield event.plain_result("❌ 参数不足\n用法: /kick <目标> <原因> [-b]")
+            return
+
+        reason = " ".join(reason_tokens)
         operator_qq = str(event.message_obj.sender.user_id)
         group_id = str(event.unified_msg_origin)
 
@@ -600,17 +626,16 @@ class GroupManagerPlugin(Star):
             yield event.plain_result("❌ 权限不足，操作取消")
             return
 
-        parts = event.message_str.strip().split(maxsplit=2)
-        if len(parts) < 3:
-            yield event.plain_result("❌ 参数不足\n用法: /warn <目标> <原因>")
-            return
-
-        target_qq = self.extract_target_qq(event)
+        target_qq, rest = self._parse_target_and_args(event)
         if not target_qq:
             yield event.plain_result("❌ 无法识别目标用户，请@用户或输入QQ号")
             return
 
-        reason = parts[2]
+        if not rest:
+            yield event.plain_result("❌ 参数不足\n用法: /warn <目标> <原因>")
+            return
+
+        reason = " ".join(rest)
         operator_qq = str(event.message_obj.sender.user_id)
         group_id = str(event.unified_msg_origin)
 
@@ -659,14 +684,10 @@ class GroupManagerPlugin(Star):
             yield event.plain_result("❌ 权限不足，操作取消")
             return
 
-        target_qq = self.extract_target_qq(event)
+        target_qq, _ = self._parse_target_and_args(event)
         if not target_qq:
-            parts = event.message_str.strip().split()
-            if len(parts) >= 2 and parts[1].isdigit():
-                target_qq = parts[1]
-            else:
-                yield event.plain_result("❌ 无法识别目标用户，请@用户或输入QQ号")
-                return
+            yield event.plain_result("❌ 无法识别目标用户，请@用户或输入QQ号")
+            return
 
         conn = sqlite3.connect(str(self.db_path))
         cursor = conn.cursor()
@@ -685,7 +706,7 @@ class GroupManagerPlugin(Star):
             SELECT id, action_type, reason, duration, timestamp, operator_qq
             FROM records
             WHERE target_qq = ? AND status = 'active'
-            ORDER BY timestamp DESC
+            ORDER BY id DESC
             LIMIT 3
         ''', (target_qq,))
         recent = cursor.fetchall()
@@ -792,7 +813,7 @@ class GroupManagerPlugin(Star):
                 blacklist = self._get_blacklist()
                 blacklist = [
                     entry for entry in blacklist
-                    if entry.get("qq") != target_qq
+                    if str(entry.get("qq")) != str(target_qq)
                 ]
                 self._save_blacklist(blacklist)
 
@@ -1145,7 +1166,7 @@ class GroupManagerPlugin(Star):
         async with self._blacklist_lock:
             blacklist = self._get_blacklist()
             original_count = len(blacklist)
-            blacklist = [entry for entry in blacklist if entry.get("qq") != target_qq]
+            blacklist = [entry for entry in blacklist if str(entry.get("qq")) != str(target_qq)]
             item_removed = len(blacklist) < original_count
             if item_removed:
                 self._save_blacklist(blacklist)
@@ -1173,10 +1194,16 @@ class GroupManagerPlugin(Star):
 
     @filter.command("gminfo")
     async def cmd_gminfo(self, event: AstrMessageEvent):
-        """全局违规记录汇总: /gminfo"""
+        """全局违规记录汇总: /gminfo [页码]"""
         if not self.check_permission(event):
             yield event.plain_result("❌ 权限不足，操作取消")
             return
+
+        parts = event.message_str.strip().split()
+        page = 1
+        # 用 isdecimal 而非 isdigit，避免上标数字等 isdigit=True 但 int() 无法解析的字符导致崩溃
+        if len(parts) >= 2 and parts[1].isdecimal():
+            page = int(parts[1])
 
         conn = sqlite3.connect(str(self.db_path))
         cursor = conn.cursor()
@@ -1202,11 +1229,18 @@ class GroupManagerPlugin(Star):
         ''')
         type_summary = cursor.fetchall()
 
+        # 明细行分页，避免全表渲染导致图片过大 / 超时 / OOM
+        page_size = 100
+        total_pages = max(1, (total_count + page_size - 1) // page_size)
+        page = max(1, min(page, total_pages))
+        offset = (page - 1) * page_size
+
         cursor.execute('''
             SELECT id, action_type, target_qq, operator_qq, reason, duration, timestamp, status
             FROM records
-            ORDER BY timestamp DESC
-        ''')
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+        ''', (page_size, offset))
         all_records = cursor.fetchall()
         conn.close()
 
@@ -1215,29 +1249,31 @@ class GroupManagerPlugin(Star):
 
         type_rows = ""
         for action_type, count, total_duration in type_summary:
-            label = action_map.get(action_type, action_type)
+            label = html.escape(action_map.get(action_type, action_type or ""))
             dur_text = f"，累计{total_duration or 0}分钟" if action_type == "mute" else ""
             type_rows += f'<tr><td>{label}</td><td>{count} 次{dur_text}</td></tr>'
 
         record_rows = ""
         for record_id, action_type, target_qq, operator_qq, reason, duration, timestamp, status in all_records:
             status_style = 'color:#e74c3c;font-weight:bold' if status == 'revoked' else 'color:#27ae60'
-            label = action_map.get(action_type, action_type)
+            # 所有来自 DB 的用户可控字段都需转义，防止存储型 HTML 注入
+            label = html.escape(action_map.get(action_type, action_type or ""))
             dur_text = f" {duration}分钟" if duration else ""
-            reason_text = reason or "-"
+            reason_text = html.escape(reason) if reason else "-"
+            status_text = html.escape(status_map.get(status, status or ""))
             record_rows += (
                 f'<tr>'
                 f'<td>{record_id}</td>'
                 f'<td>{label}{dur_text}</td>'
-                f'<td>{target_qq}</td>'
-                f'<td>{operator_qq}</td>'
+                f'<td>{html.escape(str(target_qq))}</td>'
+                f'<td>{html.escape(str(operator_qq))}</td>'
                 f'<td>{reason_text}</td>'
-                f'<td>{timestamp}</td>'
-                f'<td style="{status_style}">{status_map.get(status, status)}</td>'
+                f'<td>{html.escape(str(timestamp))}</td>'
+                f'<td style="{status_style}">{status_text}</td>'
                 f'</tr>'
             )
 
-        html = """<!DOCTYPE html>
+        html_template = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
@@ -1278,7 +1314,7 @@ body{font-family:"Microsoft YaHei","PingFang SC",sans-serif;background:#f0f2f5;p
 </div>
 <div class="type-table-wrap"><h3>分类统计</h3>
 <table class="type-table">{{ type_rows }}</table></div>
-<div class="record-table-wrap"><h3>全部记录</h3>
+<div class="record-table-wrap"><h3>{{ record_title }}</h3>
 <table class="record-table">
 <thead><tr><th>ID</th><th>类型</th><th>目标QQ</th><th>操作者</th><th>原因</th><th>时间</th><th>状态</th></tr></thead>
 <tbody>{{ record_rows }}</tbody></table></div>
@@ -1287,16 +1323,21 @@ body{font-family:"Microsoft YaHei","PingFang SC",sans-serif;background:#f0f2f5;p
 </body>
 </html>"""
 
-        url = await self.html_render(html, {
+        record_title = f"全部记录（第 {page}/{total_pages} 页，每页 {page_size} 条）"
+
+        url = await self.html_render(html_template, {
             "gen_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "total": str(total_count),
             "active": str(active_count),
             "revoked": str(revoked_count),
             "type_rows": type_rows,
             "record_rows": record_rows,
+            "record_title": record_title,
         }, return_url=True)
 
         yield event.image_result(url)
+        if total_pages > 1 and page < total_pages:
+            yield event.plain_result(f"共 {total_pages} 页，使用 /gminfo {page + 1} 查看下一页")
 
     async def terminate(self):
         """插件卸载时的清理"""
