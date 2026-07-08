@@ -14,8 +14,10 @@ from astrbot.api.message_components import Plain, At
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 
-@register("QManagementMaster", "Watanabehato", "QQ多群联动违规管理插件", "1.2.5")
+@register("QManagementMaster", "Watanabehato", "QQ多群联动违规管理插件", "1.2.6")
 class GroupManagerPlugin(Star):
+    _TEXT_AT_RE = re.compile(r"\[(?:At:|CQ:at,qq=)([0-9]+|all)(?:[^\]]*)\]", re.IGNORECASE)
+
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config  # 使用 AstrBot 配置系统
@@ -199,22 +201,37 @@ class GroupManagerPlugin(Star):
             return int(raw[:-1]) * 1440
         return int(raw)
 
-    @staticmethod
-    def _parse_text_at_token(raw: str) -> Optional[str]:
-        """解析 AstrBot 文本化的 At 占位符，如 [At:123456]。"""
-        match = re.fullmatch(r"\[At:([0-9]+|all)\]", raw.strip(), flags=re.IGNORECASE)
+    @classmethod
+    def _parse_text_at_token(cls, raw: str) -> Optional[str]:
+        """解析文本化的 At 占位符，如 [At:123456] 或 [CQ:at,qq=123456]。"""
+        match = cls._TEXT_AT_RE.search(raw.strip())
         if not match:
             return None
         return match.group(1)
 
     @classmethod
     def _strip_text_at_tokens(cls, tokens: List[str], *qqs: str) -> List[str]:
-        """从参数 token 中移除指定 QQ 的文本化 At 占位符。"""
+        """从参数 token 中移除文本化 At 占位符；不传 QQ 时移除全部。"""
         blocked = {str(qq) for qq in qqs if qq}
-        return [
-            token for token in tokens
-            if cls._parse_text_at_token(token) not in blocked
-        ]
+        cleaned_tokens: List[str] = []
+        for token in tokens:
+            def replace_at(match: re.Match) -> str:
+                at_qq = match.group(1)
+                if not blocked or at_qq in blocked:
+                    return ""
+                return match.group(0)
+
+            cleaned = cls._TEXT_AT_RE.sub(replace_at, token).strip()
+            if cleaned:
+                cleaned_tokens.append(cleaned)
+        return cleaned_tokens
+
+    @classmethod
+    def _body_without_command(cls, tokens: List[str], self_id: str = "") -> List[str]:
+        """去掉命令 token，并兼容 @bot 唤醒时命令前存在机器人 At 占位符。"""
+        if self_id:
+            tokens = cls._strip_text_at_tokens(tokens, self_id)
+        return tokens[1:] if tokens else []
 
     def init_database(self):
         """初始化 SQLite 数据库"""
@@ -272,29 +289,30 @@ class GroupManagerPlugin(Star):
         统一在此归一，返回 (target_qq 或 None, remaining_args: List[str])，
         remaining_args 不含命令名与目标 token。
         """
-        tokens = event.message_str.strip().split()
-        body = tokens[1:] if tokens else []  # tokens[0] 为命令名（如 /mute）
-
-        # 优先从消息链的 At 组件取目标：
-        # - 跳过机器人自身的 @（@提及唤醒场景下 @bot 会先于目标出现，否则会误处罚机器人）
-        # - 仅接受纯数字 QQ，排除 @全体成员（At.qq == "all"）等非数字目标，避免后续 int() 崩溃
         try:
             self_id = str(event.get_self_id())
         except Exception:
             self_id = ""
+
+        tokens = event.message_str.strip().split()
+        body = self._body_without_command(tokens, self_id)  # tokens[0] 为命令名（如 /mute）
+
+        # 优先从消息链的 At 组件取目标：
+        # - 跳过机器人自身的 @（@提及唤醒场景下 @bot 会先于目标出现，否则会误处罚机器人）
+        # - 仅接受纯数字 QQ，排除 @全体成员（At.qq == "all"）等非数字目标，避免后续 int() 崩溃
         for msg in event.get_messages():
             if isinstance(msg, At):
                 at_qq = str(msg.qq)
                 if self_id and at_qq == self_id:
                     continue
                 if at_qq.isdecimal():
-                    return at_qq, self._strip_text_at_tokens(body, self_id, at_qq)
+                    return at_qq, self._strip_text_at_tokens(body)
 
         # 部分适配器会把 @ 以 [At:QQ] 形式留在 message_str 中，但消息链里不一定有 At 组件。
         if body:
             text_at_qq = self._parse_text_at_token(body[0])
             if text_at_qq and text_at_qq.isdecimal():
-                return text_at_qq, body[1:]
+                return text_at_qq, self._strip_text_at_tokens(body[1:])
 
         # 无有效 @提及：把命令名后的第一个 token 当作纯 QQ 号
         # 用 isdecimal 而非 isdigit，确保后续 int(target_qq) 不会崩溃

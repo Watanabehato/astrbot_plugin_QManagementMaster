@@ -226,6 +226,9 @@ git clone https://github.com/Watanabehato/astrbot_plugin_QManagementMaster.git
 
 ## 🔄 版本历史
 
+### v1.2.6 (2026-07-08)
+- 🐛 进一步加固 @目标解析：识别到消息链 At 目标后会移除参数中的所有文本化 At 占位符，并兼容 `[CQ:at,qq=...]`，避免 `/mute @用户 1m 原因` 继续把 At 占位符误当成时长
+
 ### v1.2.5 (2026-07-08)
 - 🐛 修复部分适配器会在 `event.message_str` 中保留 `[At:QQ]` 占位符，导致 `/mute @用户 1m 原因` 把 At 占位符误当作时长的问题；目标解析现在会清理文本化 At 占位符，并兼容消息链缺少 At 组件的情况
 
