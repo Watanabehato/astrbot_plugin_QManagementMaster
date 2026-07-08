@@ -1,5 +1,6 @@
 import html
 import json
+import re
 import sqlite3
 import asyncio
 from pathlib import Path
@@ -13,7 +14,7 @@ from astrbot.api.message_components import Plain, At
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 
-@register("QManagementMaster", "Watanabehato", "QQ多群联动违规管理插件", "1.2.4")
+@register("QManagementMaster", "Watanabehato", "QQ多群联动违规管理插件", "1.2.5")
 class GroupManagerPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -198,6 +199,23 @@ class GroupManagerPlugin(Star):
             return int(raw[:-1]) * 1440
         return int(raw)
 
+    @staticmethod
+    def _parse_text_at_token(raw: str) -> Optional[str]:
+        """解析 AstrBot 文本化的 At 占位符，如 [At:123456]。"""
+        match = re.fullmatch(r"\[At:([0-9]+|all)\]", raw.strip(), flags=re.IGNORECASE)
+        if not match:
+            return None
+        return match.group(1)
+
+    @classmethod
+    def _strip_text_at_tokens(cls, tokens: List[str], *qqs: str) -> List[str]:
+        """从参数 token 中移除指定 QQ 的文本化 At 占位符。"""
+        blocked = {str(qq) for qq in qqs if qq}
+        return [
+            token for token in tokens
+            if cls._parse_text_at_token(token) not in blocked
+        ]
+
     def init_database(self):
         """初始化 SQLite 数据库"""
         conn = sqlite3.connect(str(self.db_path))
@@ -247,9 +265,8 @@ class GroupManagerPlugin(Star):
     def _parse_target_and_args(self, event: AstrMessageEvent) -> tuple:
         """解析处罚指令的目标 QQ 与剩余参数，兼容 @提及 与纯 QQ 号两种写法。
 
-        AstrBot 的 event.message_str 只含纯文本、@提及会被剥离，因此两种写法下
-        剩余参数落在不同的 token 位置：
-        - @提及：message_str 已不含目标 token，命令名之后的全部 token 都是剩余参数。
+        不同适配器对 @提及的 message_str 表现不同：有的会剥离 @，有的会保留
+        [At:QQ] 文本占位符。因此需要同时读取消息链组件并清理文本占位符。
         - 纯 QQ 号：目标占据命令名之后的第一个 token，剩余参数从其后开始。
 
         统一在此归一，返回 (target_qq 或 None, remaining_args: List[str])，
@@ -271,7 +288,13 @@ class GroupManagerPlugin(Star):
                 if self_id and at_qq == self_id:
                     continue
                 if at_qq.isdecimal():
-                    return at_qq, body
+                    return at_qq, self._strip_text_at_tokens(body, self_id, at_qq)
+
+        # 部分适配器会把 @ 以 [At:QQ] 形式留在 message_str 中，但消息链里不一定有 At 组件。
+        if body:
+            text_at_qq = self._parse_text_at_token(body[0])
+            if text_at_qq and text_at_qq.isdecimal():
+                return text_at_qq, body[1:]
 
         # 无有效 @提及：把命令名后的第一个 token 当作纯 QQ 号
         # 用 isdecimal 而非 isdigit，确保后续 int(target_qq) 不会崩溃

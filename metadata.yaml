@@ -1,6 +1,6 @@
 name: astrbot_plugin_QManagementMaster
 display_name: QQ多群联动违规管理插件
 desc: 支持多群联动的违规管理系统，提供禁言、踢人、警告、黑名单等功能
-version: v1.2.4
+version: v1.2.5
 author: Watanabehato
 repo: https://github.com/Watanabehato/astrbot_plugin_QManagementMaster

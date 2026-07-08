@@ -226,6 +226,9 @@ git clone https://github.com/Watanabehato/astrbot_plugin_QManagementMaster.git
 
 ## 🔄 版本历史
 
+### v1.2.5 (2026-07-08)
+- 🐛 修复部分适配器会在 `event.message_str` 中保留 `[At:QQ]` 占位符，导致 `/mute @用户 1m 原因` 把 At 占位符误当作时长的问题；目标解析现在会清理文本化 At 占位符，并兼容消息链缺少 At 组件的情况
+
 ### v1.2.4 (2026-07-08)
 - 🐛 修复 `/mute` `/kick` `/warn` 在 **@提及目标** 时因参数错位而报「参数不足」的问题（`event.message_str` 不含 @提及，导致按位置取参整体错位）；@形式与纯 QQ 号形式现已统一解析，原因支持含空格
 - 🐛 `/kick` 的 `-b` 标志不再被误并入原因文本
