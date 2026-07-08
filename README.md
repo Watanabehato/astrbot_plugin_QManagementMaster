@@ -226,6 +226,10 @@ git clone https://github.com/Watanabehato/astrbot_plugin_QManagementMaster.git
 
 ## 🔄 版本历史
 
+### v1.2.7 (2026-07-08)
+- 🐛 `/mute` 不再固定取剩余参数第一个 token 作为时长，而是从清理后的参数中定位第一个合法时长；即使适配器残留 `@昵称(QQ)` / `[At:QQ]` / `[CQ:at,qq=QQ]` 等目标 token，也不会再误报“时长格式错误”
+- 🔧 目标解析只在首个 token 确实是命令名时才移除命令，兼容 AstrBot 已经剥离命令名的场景
+
 ### v1.2.6 (2026-07-08)
 - 🐛 进一步加固 @目标解析：识别到消息链 At 目标后会移除参数中的所有文本化 At 占位符，并兼容 `[CQ:at,qq=...]`，避免 `/mute @用户 1m 原因` 继续把 At 占位符误当成时长
 

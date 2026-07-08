@@ -14,9 +14,16 @@ from astrbot.api.message_components import Plain, At
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 
-@register("QManagementMaster", "Watanabehato", "QQ多群联动违规管理插件", "1.2.6")
+@register("QManagementMaster", "Watanabehato", "QQ多群联动违规管理插件", "1.2.7")
 class GroupManagerPlugin(Star):
-    _TEXT_AT_RE = re.compile(r"\[(?:At:|CQ:at,qq=)([0-9]+|all)(?:[^\]]*)\]", re.IGNORECASE)
+    _TEXT_AT_RE = re.compile(
+        r"\[(?:At:|CQ:at,qq=)([0-9]+|all)(?:[^\]]*)\]|@[^()\s]+?\(([0-9]+)\)",
+        re.IGNORECASE,
+    )
+    _COMMAND_NAMES = {
+        "mute", "kick", "warn", "record", "undo", "g_join", "g_leave",
+        "g_log", "g_list", "blacklist", "unblacklist", "gminfo",
+    }
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -203,11 +210,11 @@ class GroupManagerPlugin(Star):
 
     @classmethod
     def _parse_text_at_token(cls, raw: str) -> Optional[str]:
-        """解析文本化的 At 占位符，如 [At:123456] 或 [CQ:at,qq=123456]。"""
+        """解析文本化的 At 占位符，如 [At:123456]、[CQ:at,qq=123456] 或 @昵称(123456)。"""
         match = cls._TEXT_AT_RE.search(raw.strip())
         if not match:
             return None
-        return match.group(1)
+        return match.group(1) or match.group(2)
 
     @classmethod
     def _strip_text_at_tokens(cls, tokens: List[str], *qqs: str) -> List[str]:
@@ -216,7 +223,7 @@ class GroupManagerPlugin(Star):
         cleaned_tokens: List[str] = []
         for token in tokens:
             def replace_at(match: re.Match) -> str:
-                at_qq = match.group(1)
+                at_qq = match.group(1) or match.group(2)
                 if not blocked or at_qq in blocked:
                     return ""
                 return match.group(0)
@@ -227,11 +234,46 @@ class GroupManagerPlugin(Star):
         return cleaned_tokens
 
     @classmethod
+    def _is_command_token(cls, token: str) -> bool:
+        command = token.strip().lower().lstrip("/|!！")
+        return command in cls._COMMAND_NAMES
+
+    @classmethod
     def _body_without_command(cls, tokens: List[str], self_id: str = "") -> List[str]:
         """去掉命令 token，并兼容 @bot 唤醒时命令前存在机器人 At 占位符。"""
         if self_id:
             tokens = cls._strip_text_at_tokens(tokens, self_id)
-        return tokens[1:] if tokens else []
+        if tokens and cls._is_command_token(tokens[0]):
+            return tokens[1:]
+        return tokens
+
+    def _parse_mute_duration_and_reason(self, rest: List[str], target_qq: str) -> tuple:
+        """从禁言剩余参数中定位时长与原因，容忍前置残留的 At/昵称 token。"""
+        args = []
+        for token in self._strip_text_at_tokens(rest):
+            if self._is_command_token(token):
+                continue
+            if target_qq and token == target_qq:
+                continue
+            args.append(token)
+
+        if not args:
+            return None, "", "missing"
+
+        for index, token in enumerate(args):
+            try:
+                duration = self._parse_duration(token)
+            except ValueError:
+                continue
+
+            reason_tokens = args[index + 1:]
+            if not reason_tokens:
+                return duration, "", "missing"
+            return duration, " ".join(reason_tokens), ""
+
+        if len(args) < 2:
+            return None, "", "missing"
+        return None, "", "invalid_duration"
 
     def init_database(self):
         """初始化 SQLite 数据库"""
@@ -518,17 +560,14 @@ class GroupManagerPlugin(Star):
             yield event.plain_result("❌ 无法识别目标用户，请@用户或输入QQ号")
             return
 
-        if len(rest) < 2:
+        duration, reason, parse_error = self._parse_mute_duration_and_reason(rest, target_qq)
+        if parse_error == "missing":
             yield event.plain_result("❌ 参数不足\n用法: /mute <目标> <时长> <原因>\n时长格式: 30m(分钟) / 2h(小时) / 1d(天) / 纯数字(分钟)")
             return
-
-        try:
-            duration = self._parse_duration(rest[0])
-        except ValueError:
+        if parse_error == "invalid_duration":
             yield event.plain_result("❌ 时长格式错误，支持: 30m(分钟) / 2h(小时) / 1d(天) / 纯数字(分钟)")
             return
 
-        reason = " ".join(rest[1:])
         operator_qq = str(event.message_obj.sender.user_id)
         group_id = str(event.unified_msg_origin)
 
